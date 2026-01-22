@@ -4,64 +4,148 @@
 SHOES_BIN="/usr/local/bin/shoes"
 SHOES_CONF_DIR="/etc/shoes"
 SHOES_CONF_FILE="${SHOES_CONF_DIR}/config.yaml"
+SHOES_LINK_FILE="${SHOES_CONF_DIR}/config.txt"
 SYSTEMD_FILE="/etc/systemd/system/shoes.service"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RESET='\033[0m'
 
-# ================== 自动侦测逻辑 ==================
-detect_and_fix() {
-    echo -e "${YELLOW}正在停止服务以进行启动项侦测...${RESET}"
-    systemctl stop shoes
+# ================== Root 检查 ==================
+require_root() {
+    [[ $EUID -ne 0 ]] && { echo -e "${RED}必须使用 root 权限！${RESET}"; exit 1; }
+}
 
-    # 确保配置文件存在
-    if [[ ! -f "$SHOES_CONF_FILE" ]]; then
-        echo -e "${RED}错误：配置文件不存在！请先运行安装选项。${RESET}"
+# ================== 辅助函数 ==================
+check_running() { systemctl is-active --quiet shoes; }
+
+# ================== 核心安装逻辑 ==================
+install_fix_ss2022() {
+    echo -e "${YELLOW}正在重新生成配置文件 (使用 OpenSSL 生成标准 SS-2022 密钥)...${RESET}"
+    
+    mkdir -p "${SHOES_CONF_DIR}"
+    
+    # 1. 生成基础参数
+    HOST_NAME=$(hostname)
+    [[ -z "$HOST_NAME" ]] && HOST_NAME="ShoeServer"
+    SNI="icloud.com"
+    
+    # 2. 生成 Reality 密钥
+    if [[ ! -x "$SHOES_BIN" ]]; then
+        echo -e "${RED}错误：找不到 shoes 二进制文件！${RESET}"
         return
     fi
+    
+    UUID=$(cat /proc/sys/kernel/random/uuid)
+    KEYPAIR=$(${SHOES_BIN} generate-reality-keypair)
+    PRIVATE_KEY=$(echo "$KEYPAIR" | grep "private key" | awk '{print $4}')
+    PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
+    SHID=$(openssl rand -hex 8)
+    
+    # 3. 生成 SS-2022 密钥 (关键修复点)
+    # 使用 2022-blake3-aes-128-gcm，需要 16 字节密钥的 Base64
+    # 使用 openssl 保证绝对标准
+    SS_METHOD="2022-blake3-aes-128-gcm"
+    SS_PASSWORD=$(openssl rand -base64 16)
+    
+    # 端口分配
+    VLESS_PORT=$(shuf -i 20000-60000 -n 1)
+    ANYTLS_PORT=$(shuf -i 20000-60000 -n 1)
+    SS_PORT=$(shuf -i 20000-60000 -n 1)
+    while [[ "$ANYTLS_PORT" == "$VLESS_PORT" ]]; do ANYTLS_PORT=$(shuf -i 20000-60000 -n 1); done
+    while [[ "$SS_PORT" == "$VLESS_PORT" || "$SS_PORT" == "$ANYTLS_PORT" ]]; do SS_PORT=$(shuf -i 20000-60000 -n 1); done
 
-    # 定义 4 种可能的启动命令模式
-    # 模式1: 标准 run -c (当前失败的)
-    CMD_1="${SHOES_BIN} run -c ${SHOES_CONF_FILE}"
-    # 模式2: 先指定 -c 再 run
-    CMD_2="${SHOES_BIN} -c ${SHOES_CONF_FILE} run"
-    # 模式3: 指定工作目录 run (不带 -c)
-    CMD_3="${SHOES_BIN} -D ${SHOES_CONF_DIR} run"
-    # 模式4: run --config (全称)
-    CMD_4="${SHOES_BIN} run --config ${SHOES_CONF_FILE}"
+    # 4. 生成证书 (AnyTLS)
+    openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
+    openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" >/dev/null 2>&1
 
-    SUCCESS_CMD=""
+    # 5. 写入配置文件 (YAML 格式严格控制)
+    cat > "${SHOES_CONF_FILE}" <<EOF
+log:
+  level: info
+  timestamp: true
 
-    # 循环测试
-    for i in 1 2 3 4; do
-        current_cmd_var="CMD_$i"
-        current_cmd="${!current_cmd_var}"
-        
-        echo -e "正在测试启动模式 [$i]: ${YELLOW}${current_cmd}${RESET}"
-        
-        # 运行命令，超时 3 秒。
-        # 如果 3 秒后是被 timeout 杀掉的 (124)，说明程序成功跑起来了没崩溃。
-        # 如果是立即退出 (101 或 1)，说明崩溃了。
-        timeout 3s $current_cmd >/dev/null 2>&1
-        EXIT_CODE=$?
+inbounds:
+  - type: vless
+    tag: vless-in
+    listen: "::"
+    listen_port: ${VLESS_PORT}
+    users:
+      - uuid: "${UUID}"
+        flow: xtls-rprx-vision
+    tls:
+      enabled: true
+      server_name: "${SNI}"
+      reality:
+        enabled: true
+        handshake:
+          server: "${SNI}"
+          port: 443
+        private_key: "${PRIVATE_KEY}"
+        short_id:
+          - "${SHID}"
+          
+  - type: vless
+    tag: anytls-in
+    listen: "::"
+    listen_port: ${ANYTLS_PORT}
+    users:
+      - uuid: "${PUBLIC_KEY}"
+        name: anylts
+    tls:
+      enabled: true
+      server_name: "${SNI}"
+      certificate_path: /etc/shoes/cert.pem
+      key_path: /etc/shoes/key.pem
 
-        if [[ $EXIT_CODE -eq 124 ]]; then
-            echo -e "${GREEN}>>> 模式 [$i] 测试成功！程序可以稳定运行。${RESET}"
-            SUCCESS_CMD="$current_cmd"
-            break
-        elif [[ $EXIT_CODE -eq 101 ]]; then
-             echo -e "${RED}>>> 模式 [$i] 失败 (Panic/崩溃)${RESET}"
-        else
-             echo -e "${RED}>>> 模式 [$i] 失败 (退出码: $EXIT_CODE)${RESET}"
-        fi
-    done
+  - type: shadowsocks
+    tag: ss-in
+    listen: "::"
+    listen_port: ${SS_PORT}
+    method: "${SS_METHOD}"
+    password: "${SS_PASSWORD}"
+EOF
+    # 注意：上面的 config 格式使用了标准结构 (inbounds列表)。
+    # 如果 shoes 是旧版 sing-box 格式 (直接列表)，上面的可能无法识别。
+    # 为了保险，我们还是用你原来脚本里的格式 (直接列表模式)，如下：
+    
+    cat > "${SHOES_CONF_FILE}" <<EOF
+- address: "0.0.0.0:${VLESS_PORT}"
+  protocol:
+    type: tls
+    reality_targets:
+      "${SNI}":
+        private_key: "${PRIVATE_KEY}"
+        short_ids: ["${SHID}"]
+        dest: "${SNI}:443"
+        vision: true
+        protocol:
+          type: vless
+          user_id: "${UUID}"
+          udp_enabled: true
+- address: "0.0.0.0:${ANYTLS_PORT}"
+  protocol:
+    type: tls
+    tls_targets:
+      "${SNI}":
+        cert: "/etc/shoes/cert.pem"
+        key: "/etc/shoes/key.pem"
+        protocol:
+          type: anytls
+          users:
+            - name: anylts
+              password: "${PUBLIC_KEY}"
+          udp_enabled: true
+- address: "0.0.0.0:${SS_PORT}"
+  protocol:
+    type: shadowsocks
+    method: "${SS_METHOD}"
+    password: "${SS_PASSWORD}"
+    udp_enabled: true
+EOF
 
-    # 应用修复
-    if [[ -n "$SUCCESS_CMD" ]]; then
-        echo -e "${YELLOW}正在将成功命令应用到系统服务...${RESET}"
-        
-        cat > "${SYSTEMD_FILE}" <<EOF
+    # 6. 修复 Systemd (使用 run -c)
+    cat > "${SYSTEMD_FILE}" <<EOF
 [Unit]
 Description=Shoes Proxy Server
 After=network.target
@@ -69,58 +153,63 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=${SUCCESS_CMD}
+# 关键：使用 run -c，这是之前测试 Panic 证明有效的入口
+ExecStart=${SHOES_BIN} run -c ${SHOES_CONF_FILE}
 Restart=on-failure
-RestartSec=3
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload
-        systemctl enable shoes
-        systemctl restart shoes
-        sleep 2
+
+    # 7. 启动测试
+    systemctl daemon-reload
+    systemctl enable shoes
+    echo -e "${YELLOW}尝试启动服务...${RESET}"
+    systemctl restart shoes
+    
+    sleep 3
+    
+    if check_running; then
+        # 生成链接
+        HOST_IP=$(curl -s -4 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}')
+        # SS Link构建: ss://base64(method:password)@ip:port
+        SS_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0)
         
-        if systemctl is-active --quiet shoes; then
-            echo -e "${GREEN}修复完成！Shoes 服务已成功启动。${RESET}"
-            echo -e "最终使用的启动命令: ${YELLOW}${SUCCESS_CMD}${RESET}"
-            
-            # 显示 SS 端口提醒
-            SS_PORT=$(grep "address: \"0.0.0.0:" "${SHOES_CONF_FILE}" | tail -n 1 | awk -F: '{print $3}' | tr -d '"')
-            echo -e "${GREEN}SS-2022 端口 (参考): ${SS_PORT}${RESET}"
-        else
-            echo -e "${RED}虽然测试通过，但 Systemd 启动仍失败。请查看日志。${RESET}"
-        fi
+        cat > "${SHOES_LINK_FILE}" <<EOF
+vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
+anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&allowInsecure=1&type=tcp#${HOST_NAME}_Anytls
+ss://${SS_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}_SS
+EOF
+        echo -e "${GREEN}SUCCESS! 服务启动成功！${RESET}"
+        cat "${SHOES_LINK_FILE}"
     else
-        echo -e "${RED}所有启动模式均失败！可能是二进制文件版本不兼容或配置文件有语法错误。${RESET}"
-        echo -e "建议：尝试手动修改配置文件，将 encryption 改为 none，或者检查 config.yaml 内容。"
+        echo -e "${RED}服务启动失败。${RESET}"
+        echo -e "${YELLOW}正在输出前台调试信息 (直接运行)...${RESET}"
+        echo "------------------------------------------------"
+        # 直接在前台运行，这样你能看到具体的 Panic 错误信息
+        ${SHOES_BIN} run -c ${SHOES_CONF_FILE}
+        echo "------------------------------------------------"
     fi
 }
 
 # ================== 菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 自动修复工具 (v5 Auto-Fix) ===${RESET}"
-    echo "1. 开始自动侦测并修复启动项 (推荐)"
-    echo "2. 查看当前配置文件"
-    echo "3. 查看当前服务日志"
+    echo -e "${GREEN}=== Shoes SS-2022 修复版 (v6) ===${RESET}"
+    echo "1. 执行修复安装 (使用 OpenSSL 生成标准密钥)"
+    echo "2. 查看当前日志"
     echo "0. 退出"
-    echo -e "${GREEN}=========================================${RESET}"
+    echo -e "${GREEN}=================================${RESET}"
     read -p "请输入选项: " choice
 }
 
-# 主逻辑
-if [[ $EUID -ne 0 ]]; then
-    echo -e "${RED}必须使用 root 权限！${RESET}"
-    exit 1
-fi
-
+require_root
 while true; do
     show_menu
     case "$choice" in
-        1) detect_and_fix; read -p "按回车继续..." ;;
-        2) cat "${SHOES_CONF_FILE}"; read -p "按回车继续..." ;;
-        3) journalctl -u shoes -n 20 --no-pager; read -p "按回车继续..." ;;
+        1) install_fix_ss2022; read -p "按回车继续..." ;;
+        2) journalctl -u shoes -n 20 --no-pager; read -p "按回车继续..." ;;
         0) exit 0 ;;
         *) echo "无效选项" ;;
     esac
