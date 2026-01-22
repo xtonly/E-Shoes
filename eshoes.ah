@@ -102,7 +102,7 @@ download_shoes() {
 
 # ================== 核心安装逻辑 ==================
 install_shoes() {
-    echo -e "${GREEN}=== 开始安装 Shoes (SS-2022 AES-256-GCM) ===${RESET}"
+    echo -e "${GREEN}=== 开始安装 Shoes (Config Fix) ===${RESET}"
     download_shoes
     mkdir -p "${SHOES_CONF_DIR}"
 
@@ -121,10 +121,8 @@ install_shoes() {
     # 3. 生成 Reality 密钥
     echo -e "${YELLOW}生成 Reality 密钥...${RESET}"
     UUID=$(cat /proc/sys/kernel/random/uuid)
-    # 尝试使用 binary 生成，失败则回退 (兼容性保护)
     KEYPAIR=$(${SHOES_BIN} generate-reality-keypair 2>/dev/null)
     if [[ -z "$KEYPAIR" ]]; then
-        # 极端的 fallback，这里直接给一个提示，一般下载成功都能运行
         echo -e "${RED}警告：二进制文件无法生成密钥，请检查兼容性！${RESET}"
         exit 1
     else
@@ -133,7 +131,7 @@ install_shoes() {
     fi
     SHID=$(openssl rand -hex 8)
 
-    # 4. 生成 SS-2022 密钥 (修改为 256-gcm)
+    # 4. 生成 SS-2022 密钥
     echo -e "${YELLOW}生成 SS-2022 (AES-256-GCM) 密钥...${RESET}"
     SS_METHOD="2022-blake3-aes-256-gcm"
     # AES-256 需要 32 字节密钥 (Base64)
@@ -145,6 +143,7 @@ install_shoes() {
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" >/dev/null 2>&1
 
     # 6. 写入配置文件
+    # 关键修复：SS 协议中使用 'cipher' 而不是 'method'
     cat > "${SHOES_CONF_FILE}" <<EOF
 - address: "0.0.0.0:${VLESS_PORT}"
   protocol:
@@ -175,12 +174,12 @@ install_shoes() {
 - address: "0.0.0.0:${SS_PORT}"
   protocol:
     type: shadowsocks
-    method: "${SS_METHOD}"
+    cipher: "${SS_METHOD}"
     password: "${SS_PASSWORD}"
     udp_enabled: true
 EOF
 
-    # 7. 配置 Systemd (使用直接路径模式)
+    # 7. 配置 Systemd
     cat > "${SYSTEMD_FILE}" <<EOF
 [Unit]
 Description=Shoes Proxy Server
@@ -211,7 +210,7 @@ EOF
     
     if check_running; then
         HOST_IP=$(curl -s -4 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}')
-        # 构建 SS 链接
+        # 构建 SS 链接 (通常客户端链接仍称之为 method，但服务端配置用 cipher)
         SS_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0)
 
         cat > "${SHOES_LINK_FILE}" <<EOF
@@ -249,7 +248,7 @@ uninstall_shoes() {
 # ================== 菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 管理脚本 (AES-256-GCM版) ===${RESET}"
+    echo -e "${GREEN}=== Shoes 管理脚本 (Fix: cipher field) ===${RESET}"
     echo "1. 安装/重置服务 (VLESS + AnyTLS + SS-2022)"
     echo "2. 卸载服务"
     echo "3. 启动服务"
@@ -258,7 +257,7 @@ show_menu() {
     echo "6. 查看节点链接"
     echo "7. 查看日志"
     echo "0. 退出"
-    echo -e "${GREEN}=======================================${RESET}"
+    echo -e "${GREEN}==========================================${RESET}"
     read -p "请输入选项: " choice
 }
 
