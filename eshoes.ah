@@ -69,6 +69,9 @@ test_shoes_binary() {
 
 # ================== 下载 Shoes ==================
 download_shoes() {
+    # 如果已经存在且可运行，跳过下载（节省时间），如需强制更新可注释掉下行
+    if check_installed && test_shoes_binary; then echo -e "${GREEN}Shoes 二进制文件已存在，跳过下载${RESET}"; return; fi
+
     get_glibc_version
     check_arch
     get_latest_version
@@ -204,6 +207,7 @@ install_shoes() {
     udp_enabled: true
 EOF
 
+    # === [关键修复]：ExecStart 增加 run -c ===
     cat > "${SYSTEMD_FILE}" <<EOF
 [Unit]
 Description=Shoes Proxy Server
@@ -212,7 +216,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=${SHOES_BIN} ${SHOES_CONF_FILE}
+ExecStart=${SHOES_BIN} run -c ${SHOES_CONF_FILE}
 Restart=on-failure
 
 [Install]
@@ -221,7 +225,9 @@ EOF
 
     systemctl daemon-reload
     systemctl enable --now shoes
-    systemctl status shoes --no-pager
+    
+    # 稍微等待一下服务启动，以便获取正确状态
+    sleep 2
 
     # 获取IP生成链接
     HOST_IP=$(curl -s -4 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}')
@@ -237,6 +243,7 @@ ss://${SS_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}_SS
 EOF
 
     echo -e "${GREEN}Shoes 安装完成！${RESET}"
+    systemctl status shoes --no-pager
     echo -e "${GREEN}链接已生成 (SNI: ${SNI}, Name: ${HOST_NAME})${RESET}"
     cat "${SHOES_LINK_FILE}"
 }
@@ -259,7 +266,7 @@ check_running() { systemctl is-active --quiet shoes; }
 # ================== 菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== E-Shoes 节点工具 ===${RESET}"
+    echo -e "${GREEN}=== Shoes 管理工具 (Fix版) ===${RESET}"
     echo -e "安装状态: $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${RED}未安装${RESET}")"
     echo -e "运行状态: $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
     echo ""
