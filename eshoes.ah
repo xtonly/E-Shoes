@@ -132,27 +132,43 @@ install_shoes() {
     download_shoes
     mkdir -p "${SHOES_CONF_DIR}"
 
-    SNI="www.ua.edu"
+    # 获取主机名
+    HOST_NAME=$(hostname)
+    [[ -z "$HOST_NAME" ]] && HOST_NAME="ShoeServer"
+
+    # 设置 SNI
+    SNI="icloud.com"
+
+    # 生成参数
     SHID=$(openssl rand -hex 8)
     VLESS_PORT=$(shuf -i 20000-60000 -n 1)
     ANYTLS_PORT=$(shuf -i 20000-60000 -n 1)
+    SS_PORT=$(shuf -i 20000-60000 -n 1) # SS 端口
+    
+    # 避免端口冲突
+    while [[ "$ANYTLS_PORT" == "$VLESS_PORT" ]]; do ANYTLS_PORT=$(shuf -i 20000-60000 -n 1); done
+    while [[ "$SS_PORT" == "$VLESS_PORT" || "$SS_PORT" == "$ANYTLS_PORT" ]]; do SS_PORT=$(shuf -i 20000-60000 -n 1); done
+
     UUID=$(cat /proc/sys/kernel/random/uuid)
     KEYPAIR=$(${SHOES_BIN} generate-reality-keypair)
     PRIVATE_KEY=$(echo "$KEYPAIR" | grep "private key" | awk '{print $4}')
     PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
-
+    
+    # SS 密码
+    SS_PASSWORD=$(openssl rand -base64 16)
+    SS_METHOD="aes-256-gcm"
 
     # 生成自签名证书
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem" || {
         echo -e "${RED}生成私钥失败${RESET}"
         exit 1
     }
-    openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=bing.com" || {
+    openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" || {
         echo -e "${RED}生成证书失败${RESET}"
         exit 1
     }
 
-
+    # 写入配置文件
     cat > "${SHOES_CONF_FILE}" <<EOF
 - address: "0.0.0.0:${VLESS_PORT}"
   protocol:
@@ -171,7 +187,7 @@ install_shoes() {
   protocol:
     type: tls
     tls_targets:
-      "www.bing.com":
+      "${SNI}":
         cert: "/etc/shoes/cert.pem"
         key: "/etc/shoes/key.pem"
         protocol:
@@ -180,6 +196,12 @@ install_shoes() {
             - name: anylts
               password: "${PUBLIC_KEY}"
           udp_enabled: true
+- address: "0.0.0.0:${SS_PORT}"
+  protocol:
+    type: shadowsocks
+    method: "${SS_METHOD}"
+    password: "${SS_PASSWORD}"
+    udp_enabled: true
 EOF
 
     cat > "${SYSTEMD_FILE}" <<EOF
@@ -201,75 +223,22 @@ EOF
     systemctl enable --now shoes
     systemctl status shoes --no-pager
 
+    # 获取IP生成链接
     HOST_IP=$(curl -s -4 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}')
-    COUNTRY=$(curl -s http://ipinfo.io/${HOST_IP}/country)
-
+    
+    # 构建 SS Base64
+    SS_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0)
+    
+    # 写入链接文件
     cat > "${SHOES_LINK_FILE}" <<EOF
-vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${COUNTRY}_Initial
-anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=www.bing.com&allowInsecure=1&type=tcp#${COUNTRY}_AnyTLS
+vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
+anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&allowInsecure=1&type=tcp#${HOST_NAME}_Anytls
+ss://${SS_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}_SS
 EOF
 
     echo -e "${GREEN}Shoes 安装完成！${RESET}"
+    echo -e "${GREEN}链接已生成 (SNI: ${SNI}, Name: ${HOST_NAME})${RESET}"
     cat "${SHOES_LINK_FILE}"
-}
-
-# ================== 额外功能: 添加节点 ==================
-add_vless_node() {
-    if ! check_installed; then
-        echo -e "${RED}请先安装 Shoes 服务！${RESET}"
-        return
-    fi
-    echo -e "${GREEN}正在添加新的 VLESS Reality 节点...${RESET}"
-    
-    # 询问 SNI
-    read -p "请输入目标 SNI (默认 www.ua.edu): " INPUT_SNI
-    SNI=${INPUT_SNI:-"www.ua.edu"}
-
-    # 生成参数
-    NEW_PORT=$(shuf -i 20000-60000 -n 1)
-    while grep -q ":${NEW_PORT}" "${SHOES_CONF_FILE}"; do
-         NEW_PORT=$(shuf -i 20000-60000 -n 1)
-    done
-    
-    SHID=$(openssl rand -hex 8)
-    UUID=$(cat /proc/sys/kernel/random/uuid)
-    KEYPAIR=$(${SHOES_BIN} generate-reality-keypair)
-    PRIVATE_KEY=$(echo "$KEYPAIR" | grep "private key" | awk '{print $4}')
-    PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
-
-    # 追加到配置文件
-    cat >> "${SHOES_CONF_FILE}" <<EOF
-- address: "0.0.0.0:${NEW_PORT}"
-  protocol:
-    type: tls
-    reality_targets:
-      "${SNI}":
-        private_key: "${PRIVATE_KEY}"
-        short_ids: ["${SHID}"]
-        dest: "${SNI}:443"
-        vision: true
-        protocol:
-          type: vless
-          user_id: "${UUID}"
-          udp_enabled: true
-EOF
-
-    # 获取IP生成链接
-    HOST_IP=$(curl -s -4 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}')
-    COUNTRY=$(curl -s http://ipinfo.io/${HOST_IP}/country)
-    
-    NEW_LINK="vless://${UUID}@${HOST_IP}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${COUNTRY}_Added"
-
-    # 追加链接到文本文件
-    echo "${NEW_LINK}" >> "${SHOES_LINK_FILE}"
-
-    # 重启服务
-    systemctl restart shoes
-    
-    echo -e "${GREEN}添加成功！${RESET}"
-    echo -e "新端口: ${YELLOW}${NEW_PORT}${RESET}"
-    echo -e "SNI: ${YELLOW}${SNI}${RESET}"
-    echo -e "链接: ${YELLOW}${NEW_LINK}${RESET}"
 }
 
 # ================== 卸载 ==================
@@ -290,18 +259,17 @@ check_running() { systemctl is-active --quiet shoes; }
 # ================== 菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 管理工具 ===${RESET}"
+    echo -e "${GREEN}=== E-Shoes 节点工具 ===${RESET}"
     echo -e "安装状态: $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${RED}未安装${RESET}")"
     echo -e "运行状态: $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
     echo ""
-    echo "1. 安装 Shoes 服务"
+    echo "1. 安装 Shoes 服务 (Reality/AnyTLS/SS)"
     echo "2. 卸载 Shoes 服务"
     echo "3. 启动 Shoes 服务"
     echo "4. 停止 Shoes 服务"
     echo "5. 重启 Shoes 服务"
     echo "6. 查看 Shoes 配置/链接"
     echo "7. 查看 Shoes 日志"
-    echo "8. 添加 VLESS Reality 节点"
     echo "0. 退出"
     echo -e "${GREEN}=====================${RESET}"
     echo ""
@@ -320,7 +288,6 @@ while true; do
         5) systemctl restart shoes ;;
         6) cat "${SHOES_LINK_FILE}" ;;
         7) journalctl -u shoes -f ;;
-        8) add_vless_node ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项！${RESET}" ;;
     esac
