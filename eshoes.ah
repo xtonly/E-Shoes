@@ -19,7 +19,7 @@ require_root() {
     [[ $EUID -ne 0 ]] && { echo -e "${RED}必须使用 root 权限！${RESET}"; exit 1; }
 }
 
-# ================== 环境/架构检测 ==================
+# ================== 架构检测 ==================
 check_arch() {
     case "$(uname -m)" in
         x86_64)
@@ -47,97 +47,104 @@ get_latest_version() {
     }
 }
 
-test_shoes_binary() {
-    ${SHOES_BIN} generate-reality-keypair >/dev/null 2>&1
-}
-
-download_shoes() {
-    if command -v shoes >/dev/null 2>&1; then
-        if test_shoes_binary; then
-            echo -e "${GREEN}检测到 Shoes 已安装且正常，跳过下载步骤。${RESET}"
+# ================== 核心下载逻辑 (智能切换) ==================
+download_shoes_smart() {
+    echo -e "${GREEN}正在准备 Shoes 核心文件...${RESET}"
+    
+    # 如果已经存在，先测试一下能不能用
+    if [[ -f "${SHOES_BIN}" ]]; then
+        chmod +x "${SHOES_BIN}"
+        if ${SHOES_BIN} generate-reality-keypair >/dev/null 2>&1; then
+            echo -e "${GREEN}检测到当前核心可用，跳过下载。${RESET}"
             return
+        else
+            echo -e "${YELLOW}检测到当前核心损坏或不兼容，准备重新下载...${RESET}"
+            rm -f "${SHOES_BIN}"
         fi
     fi
 
-    echo -e "${GREEN}开始下载 Shoes 核心...${RESET}"
     get_latest_version
     check_arch
-    
-    # 简单判定 glibc
-    GLIBC_VERSION=$(ldd --version | head -n1 | awk '{print $NF}')
-    GLIBC_MAJOR=$(echo "$GLIBC_VERSION" | cut -d. -f1)
-    if (( GLIBC_MAJOR < 2 )); then
-        DOWNLOAD_FILE="${MUSL_FILE}"
-    else
-        DOWNLOAD_FILE="${GNU_FILE}"
-    fi
-
     mkdir -p "${TMP_DIR}"
     cd "${TMP_DIR}" || exit 1
-    wget -O shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${DOWNLOAD_FILE}" || exit 1
+
+    # === 尝试 1: 下载 GNU 版本 ===
+    echo -e "${YELLOW}尝试下载 GNU 版本 (v${LATEST_VER})...${RESET}"
+    wget -O shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${GNU_FILE}"
     tar -xzf shoes.tar.gz
     mv shoes "${SHOES_BIN}"
     chmod +x "${SHOES_BIN}"
+
+    # 测试 GNU 是否能运行
+    if ${SHOES_BIN} generate-reality-keypair >/dev/null 2>&1; then
+        echo -e "${GREEN}GNU 版本运行正常！${RESET}"
+        return
+    fi
+
+    # === 尝试 2: 自动切换到 MUSL 版本 ===
+    echo -e "${RED}GNU 版本无法运行 (可能是 glibc 版本过低)${RESET}"
+    echo -e "${YELLOW}>>> 自动切换下载 MUSL 版本 (静态编译，兼容性最强)...${RESET}"
+    
+    rm -f "${SHOES_BIN}"
+    wget -O shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${MUSL_FILE}"
+    tar -xzf shoes.tar.gz
+    mv shoes "${SHOES_BIN}"
+    chmod +x "${SHOES_BIN}"
+
+    # 测试 MUSL 是否能运行
+    if ${SHOES_BIN} generate-reality-keypair >/dev/null 2>&1; then
+        echo -e "${GREEN}MUSL 版本运行正常！兼容性问题已修复。${RESET}"
+        return
+    else
+        echo -e "${RED}严重错误：MUSL 版本也无法运行！请检查系统环境。${RESET}"
+        exit 1
+    fi
 }
 
 # ================== 核心安装逻辑 ==================
 install_shoes() {
-    echo -e "${GREEN}=== 开始安装 Shoes (IPv6 恢复版) ===${RESET}"
+    echo -e "${GREEN}=== 开始安装 Shoes (Auto-Compat Fix) ===${RESET}"
     
-    # === 关键步骤：恢复 IPv6 ===
-    echo -e "${YELLOW}正在恢复 IPv6 支持...${RESET}"
-    # 1. 立即生效
+    # 1. 恢复 IPv6 (既然你确认可用)
     sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
-    sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
-    sysctl -w net.ipv6.conf.lo.disable_ipv6=0 >/dev/null 2>&1
-    # 2. 清理配置文件
     sed -i '/net.ipv6.conf.all.disable_ipv6/d' /etc/sysctl.conf
-    sed -i '/net.ipv6.conf.default.disable_ipv6/d' /etc/sysctl.conf
-    sed -i '/net.ipv6.conf.lo.disable_ipv6/d' /etc/sysctl.conf
-    sysctl -p >/dev/null 2>&1
-    echo -e "${GREEN}IPv6 功能已重新开启。${RESET}"
-    # ==========================
-
-    download_shoes
+    
+    # 2. 下载并确保二进制可用
+    download_shoes_smart
     mkdir -p "${SHOES_CONF_DIR}"
 
-    # 1. 基础信息
+    # 3. 基础信息
     HOST_NAME=$(hostname)
     [[ -z "$HOST_NAME" ]] && HOST_NAME="ShoeServer"
     SNI="icloud.com"
 
-    # 2. 生成端口
+    # 4. 生成端口
     VLESS_PORT=$(shuf -i 20000-60000 -n 1)
     ANYTLS_PORT=$(shuf -i 20000-60000 -n 1)
     SS_PORT=$(shuf -i 20000-60000 -n 1)
     while [[ "$ANYTLS_PORT" == "$VLESS_PORT" ]]; do ANYTLS_PORT=$(shuf -i 20000-60000 -n 1); done
     while [[ "$SS_PORT" == "$VLESS_PORT" || "$SS_PORT" == "$ANYTLS_PORT" ]]; do SS_PORT=$(shuf -i 20000-60000 -n 1); done
 
-    # 3. 生成 Reality 密钥
+    # 5. 生成 Reality 密钥
     echo -e "${YELLOW}生成 Reality 密钥...${RESET}"
     UUID=$(cat /proc/sys/kernel/random/uuid)
-    KEYPAIR=$(${SHOES_BIN} generate-reality-keypair 2>/dev/null)
-    if [[ -z "$KEYPAIR" ]]; then
-        echo -e "${RED}警告：二进制文件无法生成密钥，请检查兼容性！${RESET}"
-        exit 1
-    else
-        PRIVATE_KEY=$(echo "$KEYPAIR" | grep "private key" | awk '{print $4}')
-        PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
-    fi
+    # 这次一定能成功，因为 download_shoes_smart 已经验证过了
+    KEYPAIR=$(${SHOES_BIN} generate-reality-keypair)
+    PRIVATE_KEY=$(echo "$KEYPAIR" | grep "private key" | awk '{print $4}')
+    PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
     SHID=$(openssl rand -hex 8)
 
-    # 4. 生成 SS-2022 密钥
+    # 6. 生成 SS-2022 密钥 (32字节)
     echo -e "${YELLOW}生成 SS-2022 (AES-256-GCM) 密钥...${RESET}"
     SS_METHOD="2022-blake3-aes-256-gcm"
     SS_PASSWORD=$(openssl rand -base64 32)
 
-    # 5. 生成自签名证书 (AnyTLS)
+    # 7. 生成证书 (AnyTLS)
     echo -e "${YELLOW}生成 AnyTLS 证书...${RESET}"
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" >/dev/null 2>&1
 
-    # 6. 写入配置文件
-    # 更新：将 address 改为 "[::]:端口"，同时支持 IPv4 和 IPv6
+    # 8. 写入配置文件 (双栈监听 + 正确的 cipher 字段)
     cat > "${SHOES_CONF_FILE}" <<EOF
 - address: "[::]:${VLESS_PORT}"
   protocol:
@@ -173,7 +180,7 @@ install_shoes() {
     udp_enabled: true
 EOF
 
-    # 7. 配置 Systemd
+    # 9. 配置 Systemd
     cat > "${SYSTEMD_FILE}" <<EOF
 [Unit]
 Description=Shoes Proxy Server
@@ -191,7 +198,7 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-    # 8. 启动服务
+    # 10. 启动服务
     systemctl daemon-reload
     systemctl enable shoes
     echo -e "${YELLOW}正在启动服务...${RESET}"
@@ -199,41 +206,37 @@ EOF
     
     sleep 3
 
-    # 9. 状态检查与链接生成
     check_running() { systemctl is-active --quiet shoes; }
     
     if check_running; then
         HOST_IP=$(curl -s -4 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}')
-        # 尝试获取 IPv6 地址用于显示 (可选)
+        # 尝试获取 IPv6 (如果能获取到)
         HOST_IPV6=$(curl -s -6 http://ifconfig.co || echo "")
         
         SS_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0)
 
         cat > "${SHOES_LINK_FILE}" <<EOF
-# Reality (IPv4)
+# Reality
 vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
 
-# AnyTLS (IPv4)
+# AnyTLS
 anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&allowInsecure=1&type=tcp#${HOST_NAME}_Anytls
 
-# Shadowsocks-2022 (IPv4)
+# Shadowsocks-2022 (AES-256)
 ss://${SS_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}_SS
 EOF
-        
-        # 如果有 IPv6，追加 IPv6 链接
         if [[ -n "$HOST_IPV6" ]]; then
             echo "" >> "${SHOES_LINK_FILE}"
             echo "# Reality (IPv6)" >> "${SHOES_LINK_FILE}"
             echo "vless://${UUID}@[${HOST_IPV6}]:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}_v6" >> "${SHOES_LINK_FILE}"
         fi
 
-        echo -e "${GREEN}安装成功！IPv6 支持已开启。${RESET}"
+        echo -e "${GREEN}安装成功！已自动修复核心兼容性。${RESET}"
         echo -e "${GREEN}------------------------------------------------${RESET}"
         cat "${SHOES_LINK_FILE}"
         echo -e "${GREEN}------------------------------------------------${RESET}"
     else
         echo -e "${RED}服务启动失败！${RESET}"
-        echo -e "${YELLOW}尝试前台调试信息:${RESET}"
         ${SHOES_BIN} ${SHOES_CONF_FILE}
     fi
 }
@@ -252,8 +255,8 @@ uninstall_shoes() {
 # ================== 菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 管理脚本 (v10 IPv6 Ready) ===${RESET}"
-    echo "1. 安装/重置服务 (VLESS+AnyTLS+SS | 启用IPv6)"
+    echo -e "${GREEN}=== Shoes 最终完美版 (v11 Auto-Fix) ===${RESET}"
+    echo "1. 安装/重置服务 (自动修复+IPv6支持)"
     echo "2. 卸载服务"
     echo "3. 启动服务"
     echo "4. 停止服务"
@@ -271,10 +274,10 @@ while true; do
     case "$choice" in
         1) install_shoes ;;
         2) uninstall_shoes ;;
-        3) systemctl start shoes; echo "已发送启动命令" ;;
-        4) systemctl stop shoes; echo "已停止" ;;
-        5) systemctl restart shoes; echo "已重启" ;;
-        6) [[ -f "${SHOES_LINK_FILE}" ]] && cat "${SHOES_LINK_FILE}" || echo "文件不存在" ;;
+        3) systemctl start shoes; echo "Done" ;;
+        4) systemctl stop shoes; echo "Done" ;;
+        5) systemctl restart shoes; echo "Done" ;;
+        6) [[ -f "${SHOES_LINK_FILE}" ]] && cat "${SHOES_LINK_FILE}" || echo "No file" ;;
         7) journalctl -u shoes -f ;;
         0) exit 0 ;;
         *) echo "无效选项" ;;
