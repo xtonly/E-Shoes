@@ -20,12 +20,6 @@ require_root() {
 }
 
 # ================== 环境/架构检测 ==================
-get_glibc_version() {
-    GLIBC_VERSION=$(ldd --version | head -n1 | awk '{print $NF}')
-    GLIBC_MAJOR=$(echo "$GLIBC_VERSION" | cut -d. -f1)
-    GLIBC_MINOR=$(echo "$GLIBC_VERSION" | cut -d. -f2)
-}
-
 check_arch() {
     case "$(uname -m)" in
         x86_64)
@@ -43,7 +37,6 @@ check_arch() {
     esac
 }
 
-# ================== 下载与更新 ==================
 get_latest_version() {
     LATEST_VER=$(curl -s https://api.github.com/repos/cfal/shoes/releases/latest \
         | grep '"tag_name":' \
@@ -67,34 +60,21 @@ download_shoes() {
     fi
 
     echo -e "${GREEN}开始下载 Shoes 核心...${RESET}"
-    get_glibc_version
-    check_arch
     get_latest_version
-
-    if (( GLIBC_MAJOR < 2 )) || (( GLIBC_MAJOR == 2 && GLIBC_MINOR < 38 )); then
+    check_arch
+    
+    # 简单判定 glibc
+    GLIBC_VERSION=$(ldd --version | head -n1 | awk '{print $NF}')
+    GLIBC_MAJOR=$(echo "$GLIBC_VERSION" | cut -d. -f1)
+    if (( GLIBC_MAJOR < 2 )); then
         DOWNLOAD_FILE="${MUSL_FILE}"
-        DOWNLOAD_TYPE="MUSL"
     else
         DOWNLOAD_FILE="${GNU_FILE}"
-        DOWNLOAD_TYPE="GNU"
     fi
 
     mkdir -p "${TMP_DIR}"
     cd "${TMP_DIR}" || exit 1
-
-    DOWNLOAD_URL="https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${DOWNLOAD_FILE}"
-    echo -e "${GREEN}下载 (${DOWNLOAD_TYPE}): ${DOWNLOAD_URL}${RESET}"
-
-    wget -O shoes.tar.gz "$DOWNLOAD_URL" || {
-        if [[ "$DOWNLOAD_TYPE" == "GNU" ]]; then
-            echo -e "${YELLOW}GNU 版本下载失败，尝试 MUSL...${RESET}"
-            DOWNLOAD_URL="https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${MUSL_FILE}"
-            wget -O shoes.tar.gz "$DOWNLOAD_URL" || exit 1
-        else
-            exit 1
-        fi
-    }
-
+    wget -O shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${DOWNLOAD_FILE}" || exit 1
     tar -xzf shoes.tar.gz
     mv shoes "${SHOES_BIN}"
     chmod +x "${SHOES_BIN}"
@@ -102,7 +82,22 @@ download_shoes() {
 
 # ================== 核心安装逻辑 ==================
 install_shoes() {
-    echo -e "${GREEN}=== 开始安装 Shoes (Config Fix) ===${RESET}"
+    echo -e "${GREEN}=== 开始安装 Shoes (IPv6 恢复版) ===${RESET}"
+    
+    # === 关键步骤：恢复 IPv6 ===
+    echo -e "${YELLOW}正在恢复 IPv6 支持...${RESET}"
+    # 1. 立即生效
+    sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
+    sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
+    sysctl -w net.ipv6.conf.lo.disable_ipv6=0 >/dev/null 2>&1
+    # 2. 清理配置文件
+    sed -i '/net.ipv6.conf.all.disable_ipv6/d' /etc/sysctl.conf
+    sed -i '/net.ipv6.conf.default.disable_ipv6/d' /etc/sysctl.conf
+    sed -i '/net.ipv6.conf.lo.disable_ipv6/d' /etc/sysctl.conf
+    sysctl -p >/dev/null 2>&1
+    echo -e "${GREEN}IPv6 功能已重新开启。${RESET}"
+    # ==========================
+
     download_shoes
     mkdir -p "${SHOES_CONF_DIR}"
 
@@ -134,7 +129,6 @@ install_shoes() {
     # 4. 生成 SS-2022 密钥
     echo -e "${YELLOW}生成 SS-2022 (AES-256-GCM) 密钥...${RESET}"
     SS_METHOD="2022-blake3-aes-256-gcm"
-    # AES-256 需要 32 字节密钥 (Base64)
     SS_PASSWORD=$(openssl rand -base64 32)
 
     # 5. 生成自签名证书 (AnyTLS)
@@ -143,9 +137,9 @@ install_shoes() {
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" >/dev/null 2>&1
 
     # 6. 写入配置文件
-    # 关键修复：SS 协议中使用 'cipher' 而不是 'method'
+    # 更新：将 address 改为 "[::]:端口"，同时支持 IPv4 和 IPv6
     cat > "${SHOES_CONF_FILE}" <<EOF
-- address: "0.0.0.0:${VLESS_PORT}"
+- address: "[::]:${VLESS_PORT}"
   protocol:
     type: tls
     reality_targets:
@@ -158,7 +152,7 @@ install_shoes() {
           type: vless
           user_id: "${UUID}"
           udp_enabled: true
-- address: "0.0.0.0:${ANYTLS_PORT}"
+- address: "[::]:${ANYTLS_PORT}"
   protocol:
     type: tls
     tls_targets:
@@ -171,7 +165,7 @@ install_shoes() {
             - name: anylts
               password: "${PUBLIC_KEY}"
           udp_enabled: true
-- address: "0.0.0.0:${SS_PORT}"
+- address: "[::]:${SS_PORT}"
   protocol:
     type: shadowsocks
     cipher: "${SS_METHOD}"
@@ -210,20 +204,30 @@ EOF
     
     if check_running; then
         HOST_IP=$(curl -s -4 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}')
-        # 构建 SS 链接 (通常客户端链接仍称之为 method，但服务端配置用 cipher)
+        # 尝试获取 IPv6 地址用于显示 (可选)
+        HOST_IPV6=$(curl -s -6 http://ifconfig.co || echo "")
+        
         SS_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0)
 
         cat > "${SHOES_LINK_FILE}" <<EOF
-# Reality
+# Reality (IPv4)
 vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
 
-# AnyTLS
+# AnyTLS (IPv4)
 anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&allowInsecure=1&type=tcp#${HOST_NAME}_Anytls
 
-# Shadowsocks-2022 (AES-256)
+# Shadowsocks-2022 (IPv4)
 ss://${SS_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}_SS
 EOF
-        echo -e "${GREEN}安装成功！服务运行正常。${RESET}"
+        
+        # 如果有 IPv6，追加 IPv6 链接
+        if [[ -n "$HOST_IPV6" ]]; then
+            echo "" >> "${SHOES_LINK_FILE}"
+            echo "# Reality (IPv6)" >> "${SHOES_LINK_FILE}"
+            echo "vless://${UUID}@[${HOST_IPV6}]:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}_v6" >> "${SHOES_LINK_FILE}"
+        fi
+
+        echo -e "${GREEN}安装成功！IPv6 支持已开启。${RESET}"
         echo -e "${GREEN}------------------------------------------------${RESET}"
         cat "${SHOES_LINK_FILE}"
         echo -e "${GREEN}------------------------------------------------${RESET}"
@@ -248,8 +252,8 @@ uninstall_shoes() {
 # ================== 菜单 ==================
 show_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 管理脚本 (Fix: cipher field) ===${RESET}"
-    echo "1. 安装/重置服务 (VLESS + AnyTLS + SS-2022)"
+    echo -e "${GREEN}=== Shoes 管理脚本 (v10 IPv6 Ready) ===${RESET}"
+    echo "1. 安装/重置服务 (VLESS+AnyTLS+SS | 启用IPv6)"
     echo "2. 卸载服务"
     echo "3. 启动服务"
     echo "4. 停止服务"
@@ -257,7 +261,7 @@ show_menu() {
     echo "6. 查看节点链接"
     echo "7. 查看日志"
     echo "0. 退出"
-    echo -e "${GREEN}==========================================${RESET}"
+    echo -e "${GREEN}=========================================${RESET}"
     read -p "请输入选项: " choice
 }
 
