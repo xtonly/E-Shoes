@@ -23,6 +23,39 @@ require_root() {
 check_installed() { [[ -f "$SHOES_BIN" ]] && [[ -f "$SYSTEMD_FILE" ]]; }
 check_running() { systemctl is-active --quiet shoes; }
 
+# === 关键修复：智能 IP 获取 (带格式校验) ===
+get_public_ipv4() {
+    local ip=""
+    # 源1: AWS 官方 (最稳)
+    ip=$(curl -s -4 --max-time 5 http://checkip.amazonaws.com)
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$ip"; return; fi
+    
+    # 源2: ifconfig.me
+    ip=$(curl -s -4 --max-time 5 http://ifconfig.me/ip)
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$ip"; return; fi
+    
+    # 源3: api.ipify.org
+    ip=$(curl -s -4 --max-time 5 http://api.ipify.org)
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$ip"; return; fi
+
+    # 如果都失败，返回空
+    echo ""
+}
+
+get_public_ipv6() {
+    local ip=""
+    # 源1: ifconfig.co (JSON模式更稳)
+    ip=$(curl -s -6 --max-time 5 http://ifconfig.co/ip)
+    # 简单的 IPv6 正则校验 (包含冒号且不含HTML标签)
+    if [[ "$ip" == *":"* ]] && [[ "$ip" != *"<"* ]]; then echo "$ip"; return; fi
+    
+    # 源2: icanhazip
+    ip=$(curl -s -6 --max-time 5 http://icanhazip.com)
+    if [[ "$ip" == *":"* ]] && [[ "$ip" != *"<"* ]]; then echo "$ip"; return; fi
+    
+    echo ""
+}
+
 # ================== 架构检测与下载 ==================
 check_arch() {
     case "$(uname -m)" in
@@ -99,7 +132,7 @@ download_shoes_smart() {
 
 # ================== 核心安装逻辑 ==================
 install_shoes() {
-    echo -e "${GREEN}=== 开始安装 Shoes (v13 IP获取修复版) ===${RESET}"
+    echo -e "${GREEN}=== 开始安装 Shoes (v14 IP校验版) ===${RESET}"
     
     sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
     sed -i '/net.ipv6.conf.all.disable_ipv6/d' /etc/sysctl.conf
@@ -189,15 +222,18 @@ EOF
     sleep 3
 
     if check_running; then
-        echo -e "${YELLOW}正在获取公网 IP (已更换稳定源)...${RESET}"
+        echo -e "${YELLOW}正在获取公网 IP (已启用校验机制)...${RESET}"
         
-        # === 修复 IP 获取逻辑 ===
-        # 优先使用 ip.sb，备用 icanhazip.com，避免 Cloudflare 验证码
-        HOST_IP=$(curl -s -4 --max-time 5 https://ip.sb || curl -s -4 --max-time 5 https://icanhazip.com)
-        HOST_IPV6=$(curl -s -6 --max-time 5 https://ip.sb || curl -s -6 --max-time 5 https://icanhazip.com || echo "")
-        
-        # 如果获取到的 IP 包含 html 标签（极端情况），强制清空
-        if [[ "$HOST_IPV6" == *"<html"* ]]; then HOST_IPV6=""; fi
+        # === 智能获取 IP ===
+        HOST_IP=$(get_public_ipv4)
+        HOST_IPV6=$(get_public_ipv6)
+
+        if [[ -z "$HOST_IP" ]]; then
+            echo -e "${RED}警告：无法自动获取 IPv4 地址，链接中可能为空。${RESET}"
+            HOST_IP="YOUR_IPV4_HERE"
+        else
+            echo -e "${GREEN}成功获取 IPv4: ${HOST_IP}${RESET}"
+        fi
 
         SS_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0)
 
@@ -211,9 +247,13 @@ ss://${SS_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}_SS
 EOF
         if [[ -n "$HOST_IPV6" ]]; then
             echo -e "\n# Reality (IPv6)\nvless://${UUID}@[${HOST_IPV6}]:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}_v6" >> "${SHOES_LINK_FILE}"
+            echo -e "${GREEN}成功获取 IPv6: ${HOST_IPV6}${RESET}"
         fi
-        echo -e "${GREEN}安装成功！链接已生成。${RESET}"
+        
+        echo -e "${GREEN}安装成功！${RESET}"
+        echo -e "${GREEN}------------------------------------------------${RESET}"
         cat "${SHOES_LINK_FILE}"
+        echo -e "${GREEN}------------------------------------------------${RESET}"
     else
         echo -e "${RED}启动失败！${RESET}"
         ${SHOES_BIN} ${SHOES_CONF_FILE}
@@ -270,7 +310,7 @@ service_menu() {
 # ================== 主菜单 ==================
 show_main_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 管理脚本 (v13 IP Fix) ===${RESET}"
+    echo -e "${GREEN}=== Shoes 管理脚本 (v14 IP校验版) ===${RESET}"
     echo -e "状态: $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}") | $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo ""
     echo "1. 安装/重置服务 (全新安装)"
@@ -278,7 +318,7 @@ show_main_menu() {
     echo "3. 查看节点链接"
     echo "4. 查看实时日志"
     echo "0. 退出"
-    echo -e "${GREEN}==================================${RESET}"
+    echo -e "${GREEN}=====================================${RESET}"
     read -p "请输入选项: " choice
 }
 
