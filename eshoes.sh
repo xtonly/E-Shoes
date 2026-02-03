@@ -310,7 +310,7 @@ service_menu() {
 # ================== 主菜单 ==================
 show_main_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 管理脚本 (v14 IP校验版) ===${RESET}"
+    echo -e "${GREEN}=== Shoes 管理脚本 (v15 更新IP获取) ===${RESET}"
     echo -e "状态: $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}") | $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo ""
     echo "1. 安装/重置服务 (全新安装)"
