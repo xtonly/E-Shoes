@@ -52,7 +52,6 @@ get_latest_version() {
 }
 
 download_shoes_smart() {
-    # 参数 $1: 如果传入 "force"，则强制下载（用于更新）
     local force_update="$1"
 
     echo -e "${GREEN}正在准备 Shoes 核心文件...${RESET}"
@@ -65,15 +64,12 @@ download_shoes_smart() {
         fi
     fi
 
-    # 如果是更新或重新下载，先删除旧的
     rm -f "${SHOES_BIN}"
-
     get_latest_version
     check_arch
     mkdir -p "${TMP_DIR}"
     cd "${TMP_DIR}" || exit 1
 
-    # === 尝试 1: 下载 GNU 版本 ===
     echo -e "${YELLOW}尝试下载 GNU 版本 (v${LATEST_VER})...${RESET}"
     wget -O shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${GNU_FILE}"
     tar -xzf shoes.tar.gz
@@ -85,7 +81,6 @@ download_shoes_smart() {
         return
     fi
 
-    # === 尝试 2: 自动切换到 MUSL 版本 ===
     echo -e "${RED}GNU 版本无法运行，自动切换 MUSL 版本...${RESET}"
     rm -f "${SHOES_BIN}"
     wget -O shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${MUSL_FILE}"
@@ -104,9 +99,8 @@ download_shoes_smart() {
 
 # ================== 核心安装逻辑 ==================
 install_shoes() {
-    echo -e "${GREEN}=== 开始安装 Shoes (IPv6 + SS-2022) ===${RESET}"
+    echo -e "${GREEN}=== 开始安装 Shoes (v13 IP获取修复版) ===${RESET}"
     
-    # 恢复 IPv6
     sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
     sed -i '/net.ipv6.conf.all.disable_ipv6/d' /etc/sysctl.conf
     
@@ -137,7 +131,6 @@ install_shoes() {
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" >/dev/null 2>&1
 
-    # 写入配置 (双栈 + cipher修正)
     cat > "${SHOES_CONF_FILE}" <<EOF
 - address: "[::]:${VLESS_PORT}"
   protocol:
@@ -196,22 +189,30 @@ EOF
     sleep 3
 
     if check_running; then
-        HOST_IP=$(curl -s -4 http://www.cloudflare.com/cdn-cgi/trace | grep ip | awk -F= '{print $2}')
-        HOST_IPV6=$(curl -s -6 http://ifconfig.co || echo "")
+        echo -e "${YELLOW}正在获取公网 IP (已更换稳定源)...${RESET}"
+        
+        # === 修复 IP 获取逻辑 ===
+        # 优先使用 ip.sb，备用 icanhazip.com，避免 Cloudflare 验证码
+        HOST_IP=$(curl -s -4 --max-time 5 https://ip.sb || curl -s -4 --max-time 5 https://icanhazip.com)
+        HOST_IPV6=$(curl -s -6 --max-time 5 https://ip.sb || curl -s -6 --max-time 5 https://icanhazip.com || echo "")
+        
+        # 如果获取到的 IP 包含 html 标签（极端情况），强制清空
+        if [[ "$HOST_IPV6" == *"<html"* ]]; then HOST_IPV6=""; fi
+
         SS_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0)
 
         cat > "${SHOES_LINK_FILE}" <<EOF
 # Reality (IPv4)
 vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
 # AnyTLS (IPv4)
-anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&allowInsecure=1&type=tcp#${HOST_NAME}-Anytls
+anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&allowInsecure=1&type=tcp#${HOST_NAME}_Anytls
 # Shadowsocks-2022 (IPv4)
-ss://${SS_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS
+ss://${SS_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}_SS
 EOF
         if [[ -n "$HOST_IPV6" ]]; then
-            echo -e "\n# Reality (IPv6)\nvless://${UUID}@[${HOST_IPV6}]:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}-v6" >> "${SHOES_LINK_FILE}"
+            echo -e "\n# Reality (IPv6)\nvless://${UUID}@[${HOST_IPV6}]:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}_v6" >> "${SHOES_LINK_FILE}"
         fi
-        echo -e "${GREEN}安装成功！${RESET}"
+        echo -e "${GREEN}安装成功！链接已生成。${RESET}"
         cat "${SHOES_LINK_FILE}"
     else
         echo -e "${RED}启动失败！${RESET}"
@@ -269,7 +270,7 @@ service_menu() {
 # ================== 主菜单 ==================
 show_main_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 管理脚本 (v12 Final) ===${RESET}"
+    echo -e "${GREEN}=== Shoes 管理脚本 (v13 IP Fix) ===${RESET}"
     echo -e "状态: $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}") | $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo ""
     echo "1. 安装/重置服务 (全新安装)"
