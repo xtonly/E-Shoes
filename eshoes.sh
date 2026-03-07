@@ -319,7 +319,7 @@ service_menu() {
         echo "3. 启动服务"
         echo "4. 停止服务"
         echo "5. 重启服务"
-        echo "6. 更新 TLS 证书 (重新生成自签证书)"
+        echo "6. 更新 TLS 证书 (自签证书)"
         echo "0. 返回主菜单"
         echo -e "${GREEN}===============${RESET}"
         read -p "请输入选项: " sub_choice
@@ -340,7 +340,7 @@ service_menu() {
 # ================== 主菜单 ==================
 show_main_menu() {
     clear
-    echo -e "${GREEN}=== Shoes 管理脚本 (v15 更新IP获取) ===${RESET}"
+    echo -e "${GREEN}=== Shoes 管理脚本 v16 ===${RESET}"
     echo -e "状态: $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}") | $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo ""
     echo "1. 安装/重置服务 (全新安装)"
