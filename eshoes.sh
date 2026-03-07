@@ -132,7 +132,7 @@ download_shoes_smart() {
 
 # ================== 核心安装逻辑 ==================
 install_shoes() {
-    echo -e "${GREEN}=== 开始安装 Shoes (v15 更新IP获取) ===${RESET}"
+    echo -e "${GREEN}=== 开始安装 Shoes ===${RESET}"
     
     sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
     sed -i '/net.ipv6.conf.all.disable_ipv6/d' /etc/sysctl.conf
