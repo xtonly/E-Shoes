@@ -260,6 +260,34 @@ EOF
     fi
 }
 
+# ================== 证书管理 ==================
+update_certificate() {
+    echo -e "${YELLOW}正在重新生成 TLS 证书...${RESET}"
+    if [[ ! -d "${SHOES_CONF_DIR}" ]]; then
+        echo -e "${RED}错误：配置目录不存在，请先安装 Shoes！${RESET}"
+        return
+    fi
+    
+    local SNI="icloud.com"
+    
+    # 备份旧证书
+    [[ -f "${SHOES_CONF_DIR}/key.pem" ]] && mv "${SHOES_CONF_DIR}/key.pem" "${SHOES_CONF_DIR}/key.pem.bak"
+    [[ -f "${SHOES_CONF_DIR}/cert.pem" ]] && mv "${SHOES_CONF_DIR}/cert.pem" "${SHOES_CONF_DIR}/cert.pem.bak"
+
+    # 生成新证书
+    openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
+    openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" >/dev/null 2>&1
+
+    echo -e "${GREEN}证书已重新生成！正在重启服务以应用新证书...${RESET}"
+    systemctl restart shoes
+    
+    if check_running; then
+        echo -e "${GREEN}服务已重启，新证书已生效。${RESET}"
+    else
+        echo -e "${RED}服务重启失败，请检查日志！${RESET}"
+    fi
+}
+
 # ================== 服务管理子菜单 ==================
 update_core() {
     echo -e "${YELLOW}正在更新 Shoes 核心...${RESET}"
@@ -291,6 +319,7 @@ service_menu() {
         echo "3. 启动服务"
         echo "4. 停止服务"
         echo "5. 重启服务"
+        echo "6. 更新 TLS 证书 (重新生成自签证书)"
         echo "0. 返回主菜单"
         echo -e "${GREEN}===============${RESET}"
         read -p "请输入选项: " sub_choice
@@ -301,6 +330,7 @@ service_menu() {
             3) systemctl start shoes; echo -e "${GREEN}已启动${RESET}"; read -p "按回车继续..." ;;
             4) systemctl stop shoes; echo -e "${RED}已停止${RESET}"; read -p "按回车继续..." ;;
             5) systemctl restart shoes; echo -e "${GREEN}已重启${RESET}"; read -p "按回车继续..." ;;
+            6) update_certificate; read -p "按回车继续..." ;;
             0) return ;;
             *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
         esac
@@ -323,6 +353,8 @@ show_main_menu() {
 }
 
 require_root
+
+# 主循环补全
 while true; do
     show_main_menu
     case "$choice" in
