@@ -340,7 +340,7 @@ service_menu() {
 # ================== 主菜单 ==================
 show_main_menu() {
     clear
-    echo -e "${GREEN}====== Shoes 管理脚本 v16 ======${RESET}"
+    echo -e "${GREEN}====== Shoes 管理脚本 1.7 ======${RESET}"
     echo -e "状态: $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}") | $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo ""
     echo "1. 安装/重置服务 (全新安装)"
@@ -348,7 +348,7 @@ show_main_menu() {
     echo "3. 查看节点链接"
     echo "4. 查看实时日志"
     echo "0. 退出"
-    echo -e "${GREEN}==============================${RESET}"
+    echo -e "${GREEN}================================${RESET}"
     read -p "请输入选项: " choice
 }
 
