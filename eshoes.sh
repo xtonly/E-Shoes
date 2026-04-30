@@ -132,7 +132,7 @@ download_shoes_smart() {
 
 # ================== 核心安装逻辑 ==================
 install_shoes() {
-    echo -e "${GREEN}=== 开始安装 Shoes ===${RESET}"
+    echo -e "${GREEN}===== 开始安装 Shoes =====${RESET}"
     
     sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
     sed -i '/net.ipv6.conf.all.disable_ipv6/d' /etc/sysctl.conf
@@ -348,7 +348,7 @@ show_main_menu() {
     echo "3. 查看节点链接"
     echo "4. 查看实时日志"
     echo "0. 退出"
-    echo -e "${GREEN}===============================${RESET}"
+    echo -e "${GREEN}==============================${RESET}"
     read -p "请输入选项: " choice
 }
 
