@@ -1,9 +1,13 @@
 #!/bin/bash
 
-# ================== 颜色代码 ==================
-RED='\033[0;31m'
-GREEN='\033[0;32m'
+# ================== 颜色代码与风格统一 ==================
+RED='\033[1;31m'
+GREEN='\033[1;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[1;34m'
+MAGENTA='\033[1;35m'
+CYAN='\033[1;36m'
+WHITE='\033[1;37m'
 RESET='\033[0m'
 
 # ================== 常量定义 ==================
@@ -16,7 +20,7 @@ TMP_DIR="/tmp/shoesdl"
 
 # ================== Root 检查 ==================
 require_root() {
-    [[ $EUID -ne 0 ]] && { echo -e "${RED}必须使用 root 权限！${RESET}"; exit 1; }
+    [[ $EUID -ne 0 ]] && { echo -e "${RED}错误：请使用 root 用户运行此脚本${RESET}"; exit 1; }
 }
 
 # ================== 辅助函数 ==================
@@ -87,7 +91,7 @@ get_latest_version() {
 download_shoes_smart() {
     local force_update="$1"
 
-    echo -e "${GREEN}正在准备 Shoes 核心文件...${RESET}"
+    echo -e "${YELLOW}--> 正在准备 Shoes 核心文件...${RESET}"
     
     if [[ "$force_update" != "force" ]] && [[ -f "${SHOES_BIN}" ]]; then
         chmod +x "${SHOES_BIN}"
@@ -103,8 +107,8 @@ download_shoes_smart() {
     mkdir -p "${TMP_DIR}"
     cd "${TMP_DIR}" || exit 1
 
-    echo -e "${YELLOW}尝试下载 GNU 版本 (v${LATEST_VER})...${RESET}"
-    wget -O shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${GNU_FILE}"
+    echo -e "${YELLOW}--> 尝试下载 GNU 版本 (v${LATEST_VER})...${RESET}"
+    wget -qO shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${GNU_FILE}"
     tar -xzf shoes.tar.gz
     mv shoes "${SHOES_BIN}"
     chmod +x "${SHOES_BIN}"
@@ -116,7 +120,7 @@ download_shoes_smart() {
 
     echo -e "${RED}GNU 版本无法运行，自动切换 MUSL 版本...${RESET}"
     rm -f "${SHOES_BIN}"
-    wget -O shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${MUSL_FILE}"
+    wget -qO shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${MUSL_FILE}"
     tar -xzf shoes.tar.gz
     mv shoes "${SHOES_BIN}"
     chmod +x "${SHOES_BIN}"
@@ -132,7 +136,8 @@ download_shoes_smart() {
 
 # ================== 核心安装逻辑 ==================
 install_shoes() {
-    echo -e "${GREEN}===== 开始安装 Shoes =====${RESET}"
+    clear
+    echo -e "${CYAN}============= 开始部署 Shoes 代理节点 =============${RESET}"
     
     sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
     sed -i '/net.ipv6.conf.all.disable_ipv6/d' /etc/sysctl.conf
@@ -150,17 +155,17 @@ install_shoes() {
     while [[ "$ANYTLS_PORT" == "$VLESS_PORT" ]]; do ANYTLS_PORT=$(shuf -i 20000-60000 -n 1); done
     while [[ "$SS_PORT" == "$VLESS_PORT" || "$SS_PORT" == "$ANYTLS_PORT" ]]; do SS_PORT=$(shuf -i 20000-60000 -n 1); done
 
-    echo -e "${YELLOW}生成密钥...${RESET}"
+    echo -e "${YELLOW}--> 正在生成安全密钥...${RESET}"
     UUID=$(cat /proc/sys/kernel/random/uuid)
     KEYPAIR=$(${SHOES_BIN} generate-reality-keypair)
     PRIVATE_KEY=$(echo "$KEYPAIR" | grep "private key" | awk '{print $4}')
     PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
     SHID=$(openssl rand -hex 8)
 
-    SS_METHOD="2022-blake3-aes-256-gcm"
+    SS_METHOD="2022-blake3-aes-128-gcm"
     SS_PASSWORD=$(openssl rand -base64 32)
 
-    echo -e "${YELLOW}生成证书...${RESET}"
+    echo -e "${YELLOW}--> 正在生成自签 TLS 证书...${RESET}"
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" >/dev/null 2>&1
 
@@ -216,13 +221,14 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
+    echo -e "${YELLOW}--> 正在注册并启动系统服务...${RESET}"
     systemctl daemon-reload
-    systemctl enable shoes
+    systemctl enable shoes >/dev/null 2>&1
     systemctl restart shoes
     sleep 3
 
     if check_running; then
-        echo -e "${YELLOW}正在获取公网 IP (已启用校验机制)...${RESET}"
+        echo -e "${YELLOW}--> 正在获取公网 IP (已启用校验机制)...${RESET}"
         
         # === 智能获取 IP ===
         HOST_IP=$(get_public_ipv4)
@@ -250,19 +256,19 @@ EOF
             echo -e "${GREEN}成功获取 IPv6: ${HOST_IPV6}${RESET}"
         fi
         
-        echo -e "${GREEN}安装成功！${RESET}"
-        echo -e "${GREEN}------------------------------------------------${RESET}"
+        echo -e "\n${GREEN}Shoes 节点服务安装成功！${RESET}"
+        echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
         cat "${SHOES_LINK_FILE}"
-        echo -e "${GREEN}------------------------------------------------${RESET}"
+        echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
     else
-        echo -e "${RED}启动失败！${RESET}"
+        echo -e "${RED}服务启动失败！以下为调试信息：${RESET}"
         ${SHOES_BIN} ${SHOES_CONF_FILE}
     fi
 }
 
 # ================== 证书管理 ==================
 update_certificate() {
-    echo -e "${YELLOW}正在重新生成 TLS 证书...${RESET}"
+    echo -e "\n${YELLOW}--> 正在重新生成 TLS 证书...${RESET}"
     if [[ ! -d "${SHOES_CONF_DIR}" ]]; then
         echo -e "${RED}错误：配置目录不存在，请先安装 Shoes！${RESET}"
         return
@@ -278,19 +284,19 @@ update_certificate() {
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" >/dev/null 2>&1
 
-    echo -e "${GREEN}证书已重新生成！正在重启服务以应用新证书...${RESET}"
+    echo -e "${YELLOW}--> 正在重启服务以应用新证书...${RESET}"
     systemctl restart shoes
     
     if check_running; then
-        echo -e "${GREEN}服务已重启，新证书已生效。${RESET}"
+        echo -e "${GREEN}服务已重启，新自签证书已生效。${RESET}"
     else
-        echo -e "${RED}服务重启失败，请检查日志！${RESET}"
+        echo -e "${RED}服务重启失败，请检查系统日志！${RESET}"
     fi
 }
 
 # ================== 服务管理子菜单 ==================
 update_core() {
-    echo -e "${YELLOW}正在更新 Shoes 核心...${RESET}"
+    echo -e "\n${YELLOW}--> 正在更新 Shoes 核心文件...${RESET}"
     systemctl stop shoes
     download_shoes_smart "force"
     systemctl restart shoes
@@ -298,41 +304,43 @@ update_core() {
 }
 
 uninstall_shoes() {
-    echo -e "${YELLOW}正在卸载...${RESET}"
-    systemctl stop shoes
-    systemctl disable shoes
+    echo -e "\n${YELLOW}--> 正在停止并卸载 Shoes 服务...${RESET}"
+    systemctl stop shoes >/dev/null 2>&1
+    systemctl disable shoes >/dev/null 2>&1
     rm -f "${SYSTEMD_FILE}"
     rm -rf "${SHOES_CONF_DIR}"
     rm -f "${SHOES_BIN}"
     systemctl daemon-reload
-    echo -e "${GREEN}Shoes 已完全卸载。${RESET}"
+    echo -e "${GREEN}Shoes 及其相关配置已完全卸载。${RESET}"
 }
 
 service_menu() {
     while true; do
         clear
-        echo -e "${GREEN}=== 服务管理 ===${RESET}"
-        echo -e "运行状态: $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
-        echo ""
-        echo "1. 更新 Shoes 核心 (保留配置)"
-        echo "2. 卸载服务"
-        echo "3. 启动服务"
-        echo "4. 停止服务"
-        echo "5. 重启服务"
-        echo "6. 更新 TLS 证书 (自签证书)"
-        echo "0. 返回主菜单"
-        echo -e "${GREEN}===============${RESET}"
-        read -p "请输入选项: " sub_choice
+        echo -e "${MAGENTA}=========================================================${RESET}"
+        echo -e "${CYAN}                 Shoes 节点服务管理子菜单                ${RESET}"
+        echo -e "${MAGENTA}=========================================================${RESET}"
+        echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
+        echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
+        echo "  1. 更新 Shoes 核心 (保留配置)"
+        echo "  2. 卸载服务"
+        echo "  3. 启动服务"
+        echo "  4. 停止服务"
+        echo "  5. 重启服务"
+        echo "  6. 更新 TLS 证书 (自签证书)"
+        echo "  0. 返回主菜单"
+        echo -e "${MAGENTA}=========================================================${RESET}"
+        read -p "  请输入对应的数字选项: " sub_choice
 
         case "$sub_choice" in
-            1) update_core; read -p "按回车继续..." ;;
-            2) uninstall_shoes; read -p "按回车继续..." ;;
-            3) systemctl start shoes; echo -e "${GREEN}已启动${RESET}"; read -p "按回车继续..." ;;
-            4) systemctl stop shoes; echo -e "${RED}已停止${RESET}"; read -p "按回车继续..." ;;
-            5) systemctl restart shoes; echo -e "${GREEN}已重启${RESET}"; read -p "按回车继续..." ;;
-            6) update_certificate; read -p "按回车继续..." ;;
+            1) update_core; echo "" && read -n 1 -s -r -p "按任意键返回..." ;;
+            2) uninstall_shoes; echo "" && read -n 1 -s -r -p "按任意键返回..." ;;
+            3) systemctl start shoes; echo -e "\n${GREEN}服务已启动${RESET}"; sleep 1 ;;
+            4) systemctl stop shoes; echo -e "\n${RED}服务已停止${RESET}"; sleep 1 ;;
+            5) systemctl restart shoes; echo -e "\n${GREEN}服务已重启${RESET}"; sleep 1 ;;
+            6) update_certificate; echo "" && read -n 1 -s -r -p "按任意键返回..." ;;
             0) return ;;
-            *) echo -e "${RED}无效选项${RESET}"; sleep 1 ;;
+            *) echo -e "${RED}无效选项，请重新输入！${RESET}"; sleep 1 ;;
         esac
     done
 }
@@ -340,16 +348,19 @@ service_menu() {
 # ================== 主菜单 ==================
 show_main_menu() {
     clear
-    echo -e "${GREEN}====== Shoes 管理脚本 1.7 ======${RESET}"
-    echo -e "状态: $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}") | $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
-    echo ""
-    echo "1. 安装/重置服务 (全新安装)"
-    echo "2. 服务管理 (更新/卸载/启停)"
-    echo "3. 查看节点链接"
-    echo "4. 查看实时日志"
-    echo "0. 退出"
-    echo -e "${GREEN}================================${RESET}"
-    read -p "请输入选项: " choice
+    echo -e "${MAGENTA}=========================================================${RESET}"
+    echo -e "${CYAN}               E-Shoes 代理节点一键管理脚本1.8                ${RESET}"
+    echo -e "${MAGENTA}=========================================================${RESET}"
+    echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
+    echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
+    echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
+    echo "  1. 安装/重置服务 (全新安装)"
+    echo "  2. 服务管理 (更新/卸载/启停)"
+    echo "  3. 查看节点链接配置"
+    echo "  4. 查看系统实时日志"
+    echo "  0. 退出脚本"
+    echo -e "${MAGENTA}=========================================================${RESET}"
+    read -p "  请输入对应的数字选项: " choice
 }
 
 require_root
@@ -358,11 +369,33 @@ require_root
 while true; do
     show_main_menu
     case "$choice" in
-        1) install_shoes; read -p "按回车继续..." ;;
-        2) service_menu ;;
-        3) [[ -f "${SHOES_LINK_FILE}" ]] && cat "${SHOES_LINK_FILE}" || echo "配置文件不存在"; read -p "按回车继续..." ;;
-        4) journalctl -u shoes -f ;;
-        0) exit 0 ;;
-        *) echo "无效选项"; sleep 1 ;;
+        1) 
+            install_shoes
+            echo "" && read -n 1 -s -r -p "按任意键继续..." 
+            ;;
+        2) 
+            service_menu 
+            ;;
+        3) 
+            echo -e "\n${CYAN}--- 当前节点配置链接 ---${RESET}"
+            if [[ -f "${SHOES_LINK_FILE}" ]]; then
+                cat "${SHOES_LINK_FILE}"
+            else
+                echo -e "${YELLOW}配置文件不存在，请先执行安装步骤。${RESET}"
+            fi
+            echo "" && read -n 1 -s -r -p "按任意键继续..." 
+            ;;
+        4) 
+            echo -e "\n${YELLOW}--> 按 Ctrl+C 退出日志查看${RESET}"
+            journalctl -u shoes -f 
+            ;;
+        0) 
+            echo -e "已退出脚本。"
+            exit 0 
+            ;;
+        *) 
+            echo -e "${RED}无效选项，请重新输入！${RESET}"
+            sleep 1 
+            ;;
     esac
 done
