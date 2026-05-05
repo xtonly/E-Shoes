@@ -162,6 +162,7 @@ install_shoes() {
     PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
     SHID=$(openssl rand -hex 8)
 
+    # 修复：保持使用 aes-128，并将密码长度缩短为 16 字节以匹配算法要求[cite: 1]
     SS_METHOD="2022-blake3-aes-128-gcm"
     SS_PASSWORD=$(openssl rand -base64 16)
 
@@ -241,7 +242,8 @@ EOF
             echo -e "${GREEN}成功获取 IPv4: ${HOST_IP}${RESET}"
         fi
 
-        SS_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0)
+        # 修复：SS2022 链接规范要求密码本身即为合法的 Base64 PSK，不需要添加前缀[cite: 1]
+        SS_LINK_BASE=$(echo -n "${SS_PASSWORD}" | tr -d '\n\r')
 
         cat > "${SHOES_LINK_FILE}" <<EOF
 # Reality (IPv4)
@@ -249,7 +251,7 @@ vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&s
 # AnyTLS (IPv4)
 anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&allowInsecure=1&type=tcp#${HOST_NAME}-Anytls
 # Shadowsocks-2022 (IPv4)
-ss://${SS_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS
+ss://${SS_LINK_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS
 EOF
         if [[ -n "$HOST_IPV6" ]]; then
             echo -e "\n# Reality (IPv6)\nvless://${UUID}@[${HOST_IPV6}]:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}-v6" >> "${SHOES_LINK_FILE}"
@@ -349,7 +351,7 @@ service_menu() {
 show_main_menu() {
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 1.8                  ${RESET}"
+    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 1.9                  ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
