@@ -162,7 +162,7 @@ install_shoes() {
     PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
     SHID=$(openssl rand -hex 8)
 
-    # 修复：保持使用 aes-128，并将密码长度缩短为 16 字节以匹配算法要求[cite: 1]
+    # === 核心修复点 1：保持 128 位加密，并生成 16 字节长度的密码 ===
     SS_METHOD="2022-blake3-aes-128-gcm"
     SS_PASSWORD=$(openssl rand -base64 16)
 
@@ -242,8 +242,8 @@ EOF
             echo -e "${GREEN}成功获取 IPv4: ${HOST_IP}${RESET}"
         fi
 
-        # 修复：SS2022 链接规范要求密码本身即为合法的 Base64 PSK，不需要添加前缀[cite: 1]
-        SS_LINK_BASE=$(echo -n "${SS_PASSWORD}" | tr -d '\n\r')
+        # === 核心修复点 2：严格遵守 SIP002 标准，将 Method 和 Password 组合后进行 Base64 编码 ===
+        SS_LINK_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0)
 
         cat > "${SHOES_LINK_FILE}" <<EOF
 # Reality (IPv4)
@@ -351,7 +351,7 @@ service_menu() {
 show_main_menu() {
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 1.9                  ${RESET}"
+    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 2.0                  ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
