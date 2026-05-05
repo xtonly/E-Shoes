@@ -163,7 +163,7 @@ install_shoes() {
     SHID=$(openssl rand -hex 8)
 
     SS_METHOD="2022-blake3-aes-128-gcm"
-    SS_PASSWORD=$(openssl rand -base64 32)
+    SS_PASSWORD=$(openssl rand -base64 16)
 
     echo -e "${YELLOW}--> 正在生成自签 TLS 证书...${RESET}"
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
