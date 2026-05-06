@@ -139,8 +139,11 @@ install_shoes() {
     clear
     echo -e "${CYAN}============= 开始部署 Shoes 代理节点 =============${RESET}"
     
+    # 修复：极简系统可能没有此文件，加入文件存在性判断，避免 sed 报错
     sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
-    sed -i '/net.ipv6.conf.all.disable_ipv6/d' /etc/sysctl.conf
+    if [[ -f /etc/sysctl.conf ]]; then
+        sed -i '/net.ipv6.conf.all.disable_ipv6/d' /etc/sysctl.conf
+    fi
     
     download_shoes_smart "normal"
     mkdir -p "${SHOES_CONF_DIR}"
@@ -162,7 +165,7 @@ install_shoes() {
     PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
     SHID=$(openssl rand -hex 8)
 
-    # === 核心修复点 1：保持 128 位加密，并生成 16 字节长度的密码 ===
+    # 保持 128 位加密，并生成 16 字节长度的密码
     SS_METHOD="2022-blake3-aes-128-gcm"
     SS_PASSWORD=$(openssl rand -base64 16)
 
@@ -242,7 +245,7 @@ EOF
             echo -e "${GREEN}成功获取 IPv4: ${HOST_IP}${RESET}"
         fi
 
-        # === 核心修复点 2：严格遵守 SIP002 标准，将 Method 和 Password 组合后进行 Base64 编码 ===
+        # 严格遵守 SIP002 标准，将 Method 和 Password 组合后进行 Base64 编码
         SS_LINK_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0)
 
         cat > "${SHOES_LINK_FILE}" <<EOF
@@ -351,7 +354,7 @@ service_menu() {
 show_main_menu() {
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 2.0                  ${RESET}"
+    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 2.1                  ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
