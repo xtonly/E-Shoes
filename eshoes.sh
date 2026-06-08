@@ -27,15 +27,12 @@ require_root() {
 check_installed() { [[ -f "$SHOES_BIN" ]] && [[ -f "$SYSTEMD_FILE" ]]; }
 check_running() { systemctl is-active --quiet shoes; }
 
-# === 新增：强制系统时间同步 (解决 SS-2022 的 EOF 痛点) ===
+# === 强制系统时间同步 (解决 SS-2022 的 EOF 痛点) ===
 sync_system_time() {
     echo -e "${YELLOW}--> 正在强制同步服务器时间 (SS-2022 强依赖精准时间)...${RESET}"
-    # 启用 systemd 默认的网络时间同步
     if command -v timedatectl >/dev/null 2>&1; then
         timedatectl set-ntp true >/dev/null 2>&1
     fi
-    
-    # 尝试安装并使用 chrony 进行高精度同步 (兼容 Debian/Ubuntu)
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update -y >/dev/null 2>&1
         apt-get install -y chrony >/dev/null 2>&1
@@ -145,7 +142,7 @@ install_shoes() {
     clear
     echo -e "${CYAN}============= 开始部署 Shoes 代理节点 =============${RESET}"
     
-    # 执行强制时间同步
+    # 执行强制时间同步 (已成功验证)
     sync_system_time
 
     sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
@@ -173,17 +170,21 @@ install_shoes() {
     PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
     SHID=$(openssl rand -hex 8)
 
-    # === 修改核心：SS-2022 多用户模式配置 ===
-    # 使用 256 位加密，分别生成 32 字节的主密钥(Server)和用户密钥(User)
+    # === 修改核心：回归核心支持的单用户模式，升至256位加密，且调用核心原生方法生成密码 ===
     SS_METHOD="2022-blake3-aes-256-gcm"
-    SERVER_KEY=$(openssl rand -base64 32)
-    USER_KEY=$(openssl rand -base64 32)
+    echo -e "${YELLOW}--> 正在生成 SS-2022 规范密码...${RESET}"
+    # 使用 shoes 核心自带的命令生成严格对齐的密码
+    SS_PASSWORD=$(${SHOES_BIN} generate-shadowsocks-2022-password ${SS_METHOD} 2>/dev/null)
+    # 如果核心命令由于某种原因失败，作为兜底用 openssl 生成 32 bytes 密钥
+    if [[ -z "$SS_PASSWORD" ]]; then
+        SS_PASSWORD=$(openssl rand -base64 32)
+    fi
 
     echo -e "${YELLOW}--> 正在生成自签 TLS 证书...${RESET}"
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" >/dev/null 2>&1
 
-    # 注意查看 shadowsocks 节点中的 users 列表结构
+    # 移除了不支持的 users 数组，仅使用 password 字段
     cat > "${SHOES_CONF_FILE}" <<EOF
 - address: "[::]:${VLESS_PORT}"
   protocol:
@@ -215,10 +216,7 @@ install_shoes() {
   protocol:
     type: shadowsocks
     cipher: "${SS_METHOD}"
-    password: "${SERVER_KEY}"
-    users:
-      - name: "shoes_user1"
-        password: "${USER_KEY}"
+    password: "${SS_PASSWORD}"
     udp_enabled: true
 EOF
 
@@ -258,15 +256,15 @@ EOF
             echo -e "${GREEN}成功获取 IPv4: ${HOST_IP}${RESET}"
         fi
 
-        # 严格遵守 SIP022 多用户标准：将 Method:ServerKey:UserKey 组合后进行 Base64 编码
-        SS_LINK_BASE=$(echo -n "${SS_METHOD}:${SERVER_KEY}:${USER_KEY}" | base64 -w 0 | tr -d '\n')
+        # 严格遵守单用户标准拼接 URL Base64
+        SS_LINK_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0 | tr -d '\n')
 
         cat > "${SHOES_LINK_FILE}" <<EOF
 # Reality (IPv4)
 vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
 # AnyTLS (IPv4)
 anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&allowInsecure=1&type=tcp#${HOST_NAME}-Anytls
-# Shadowsocks-2022 (IPv4, Multi-User)
+# Shadowsocks-2022 (IPv4, 单用户高强加密)
 ss://${SS_LINK_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS2022
 EOF
         if [[ -n "$HOST_IPV6" ]]; then
@@ -365,7 +363,7 @@ service_menu() {
 show_main_menu() {
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 2.2 (修复版)         ${RESET}"
+    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 2.3                  ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
