@@ -27,36 +27,42 @@ require_root() {
 check_installed() { [[ -f "$SHOES_BIN" ]] && [[ -f "$SYSTEMD_FILE" ]]; }
 check_running() { systemctl is-active --quiet shoes; }
 
-# === 关键修复：智能 IP 获取 (带格式校验) ===
+# === 新增：强制系统时间同步 (解决 SS-2022 的 EOF 痛点) ===
+sync_system_time() {
+    echo -e "${YELLOW}--> 正在强制同步服务器时间 (SS-2022 强依赖精准时间)...${RESET}"
+    # 启用 systemd 默认的网络时间同步
+    if command -v timedatectl >/dev/null 2>&1; then
+        timedatectl set-ntp true >/dev/null 2>&1
+    fi
+    
+    # 尝试安装并使用 chrony 进行高精度同步 (兼容 Debian/Ubuntu)
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y >/dev/null 2>&1
+        apt-get install -y chrony >/dev/null 2>&1
+        systemctl restart chronyd >/dev/null 2>&1
+        chronyc makestep >/dev/null 2>&1
+    fi
+    echo -e "${GREEN}时间同步完成，当前服务器时间: $(date)${RESET}"
+}
+
+# === 智能 IP 获取 (带格式校验) ===
 get_public_ipv4() {
     local ip=""
-    # 源1: AWS 官方 (最稳)
     ip=$(curl -s -4 --max-time 5 http://checkip.amazonaws.com)
     if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$ip"; return; fi
-    
-    # 源2: ifconfig.me
     ip=$(curl -s -4 --max-time 5 http://ifconfig.me/ip)
     if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$ip"; return; fi
-    
-    # 源3: api.ipify.org
     ip=$(curl -s -4 --max-time 5 http://api.ipify.org)
     if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$ip"; return; fi
-
-    # 如果都失败，返回空
     echo ""
 }
 
 get_public_ipv6() {
     local ip=""
-    # 源1: ifconfig.co (JSON模式更稳)
     ip=$(curl -s -6 --max-time 5 http://ifconfig.co/ip)
-    # 简单的 IPv6 正则校验 (包含冒号且不含HTML标签)
     if [[ "$ip" == *":"* ]] && [[ "$ip" != *"<"* ]]; then echo "$ip"; return; fi
-    
-    # 源2: icanhazip
     ip=$(curl -s -6 --max-time 5 http://icanhazip.com)
     if [[ "$ip" == *":"* ]] && [[ "$ip" != *"<"* ]]; then echo "$ip"; return; fi
-    
     echo ""
 }
 
@@ -139,7 +145,9 @@ install_shoes() {
     clear
     echo -e "${CYAN}============= 开始部署 Shoes 代理节点 =============${RESET}"
     
-    # 修复：极简系统可能没有此文件，加入文件存在性判断，避免 sed 报错
+    # 执行强制时间同步
+    sync_system_time
+
     sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
     if [[ -f /etc/sysctl.conf ]]; then
         sed -i '/net.ipv6.conf.all.disable_ipv6/d' /etc/sysctl.conf
@@ -165,14 +173,17 @@ install_shoes() {
     PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
     SHID=$(openssl rand -hex 8)
 
-    # 保持 128 位加密，并生成 16 字节长度的密码
-    SS_METHOD="2022-blake3-aes-128-gcm"
-    SS_PASSWORD=$(openssl rand -base64 16)
+    # === 修改核心：SS-2022 多用户模式配置 ===
+    # 使用 256 位加密，分别生成 32 字节的主密钥(Server)和用户密钥(User)
+    SS_METHOD="2022-blake3-aes-256-gcm"
+    SERVER_KEY=$(openssl rand -base64 32)
+    USER_KEY=$(openssl rand -base64 32)
 
     echo -e "${YELLOW}--> 正在生成自签 TLS 证书...${RESET}"
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" >/dev/null 2>&1
 
+    # 注意查看 shadowsocks 节点中的 users 列表结构
     cat > "${SHOES_CONF_FILE}" <<EOF
 - address: "[::]:${VLESS_PORT}"
   protocol:
@@ -204,7 +215,10 @@ install_shoes() {
   protocol:
     type: shadowsocks
     cipher: "${SS_METHOD}"
-    password: "${SS_PASSWORD}"
+    password: "${SERVER_KEY}"
+    users:
+      - name: "shoes_user1"
+        password: "${USER_KEY}"
     udp_enabled: true
 EOF
 
@@ -232,9 +246,8 @@ EOF
     sleep 3
 
     if check_running; then
-        echo -e "${YELLOW}--> 正在获取公网 IP (已启用校验机制)...${RESET}"
+        echo -e "${YELLOW}--> 正在获取公网 IP...${RESET}"
         
-        # === 智能获取 IP ===
         HOST_IP=$(get_public_ipv4)
         HOST_IPV6=$(get_public_ipv6)
 
@@ -245,16 +258,16 @@ EOF
             echo -e "${GREEN}成功获取 IPv4: ${HOST_IP}${RESET}"
         fi
 
-        # 严格遵守 SIP002 标准，将 Method 和 Password 组合后进行 Base64 编码
-        SS_LINK_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0)
+        # 严格遵守 SIP022 多用户标准：将 Method:ServerKey:UserKey 组合后进行 Base64 编码
+        SS_LINK_BASE=$(echo -n "${SS_METHOD}:${SERVER_KEY}:${USER_KEY}" | base64 -w 0 | tr -d '\n')
 
         cat > "${SHOES_LINK_FILE}" <<EOF
 # Reality (IPv4)
 vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
 # AnyTLS (IPv4)
 anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&allowInsecure=1&type=tcp#${HOST_NAME}-Anytls
-# Shadowsocks-2022 (IPv4)
-ss://${SS_LINK_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS
+# Shadowsocks-2022 (IPv4, Multi-User)
+ss://${SS_LINK_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS2022
 EOF
         if [[ -n "$HOST_IPV6" ]]; then
             echo -e "\n# Reality (IPv6)\nvless://${UUID}@[${HOST_IPV6}]:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}-v6" >> "${SHOES_LINK_FILE}"
@@ -281,11 +294,9 @@ update_certificate() {
     
     local SNI="icloud.com"
     
-    # 备份旧证书
     [[ -f "${SHOES_CONF_DIR}/key.pem" ]] && mv "${SHOES_CONF_DIR}/key.pem" "${SHOES_CONF_DIR}/key.pem.bak"
     [[ -f "${SHOES_CONF_DIR}/cert.pem" ]] && mv "${SHOES_CONF_DIR}/cert.pem" "${SHOES_CONF_DIR}/cert.pem.bak"
 
-    # 生成新证书
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" >/dev/null 2>&1
 
@@ -301,7 +312,7 @@ update_certificate() {
 
 # ================== 服务管理子菜单 ==================
 update_core() {
-    echo -e "\n${YELLOW}--> 正在更新 Shoes 核心文件...${RESET}"
+    echo -e "\n${YELLOW}--> 正在更新 Shoes 核心...${RESET}"
     systemctl stop shoes
     download_shoes_smart "force"
     systemctl restart shoes
@@ -354,7 +365,7 @@ service_menu() {
 show_main_menu() {
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 2.1                  ${RESET}"
+    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 2.2 (修复版)         ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
@@ -370,7 +381,6 @@ show_main_menu() {
 
 require_root
 
-# 主循环补全
 while true; do
     show_main_menu
     case "$choice" in
