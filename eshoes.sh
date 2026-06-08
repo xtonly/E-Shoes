@@ -29,7 +29,7 @@ check_running() { systemctl is-active --quiet shoes; }
 
 # === 强制系统时间同步 ===
 sync_system_time() {
-    echo -e "${YELLOW}--> 正在强制同步服务器时间 (SS-2022 强依赖精准时间)...${RESET}"
+    echo -e "${YELLOW}--> 正在强制同步服务器时间 (SS-2022 精准时间)...${RESET}"
     if command -v timedatectl >/dev/null 2>&1; then
         timedatectl set-ntp true >/dev/null 2>&1
     fi
@@ -358,7 +358,7 @@ service_menu() {
 show_main_menu() {
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 2.5                  ${RESET}"
+    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 2.4                  ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
