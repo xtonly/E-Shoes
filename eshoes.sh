@@ -155,7 +155,7 @@ install_shoes() {
 
     HOST_NAME=$(hostname)
     [[ -z "$HOST_NAME" ]] && HOST_NAME="ShoeServer"
-    SNI="icloud.com"
+    SNI="updates.cdn-apple.com"
 
     VLESS_PORT=$(shuf -i 20000-60000 -n 1)
     ANYTLS_PORT=$(shuf -i 20000-60000 -n 1)
@@ -285,7 +285,7 @@ update_certificate() {
         return
     fi
     
-    local SNI="icloud.com"
+    local SNI="updates.cdn-apple.com"
     
     [[ -f "${SHOES_CONF_DIR}/key.pem" ]] && mv "${SHOES_CONF_DIR}/key.pem" "${SHOES_CONF_DIR}/key.pem.bak"
     [[ -f "${SHOES_CONF_DIR}/cert.pem" ]] && mv "${SHOES_CONF_DIR}/cert.pem" "${SHOES_CONF_DIR}/cert.pem.bak"
@@ -358,7 +358,7 @@ service_menu() {
 show_main_menu() {
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 2.5                  ${RESET}"
+    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 2.6                  ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
