@@ -180,8 +180,9 @@ install_shoes() {
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" >/dev/null 2>&1
 
+    # 修复：将所有监听地址从 [::] 改为 0.0.0.0，防止在无 IPv6 环境下直接 Panic
     cat > "${SHOES_CONF_FILE}" <<EOF
-- address: "[::]:${VLESS_PORT}"
+- address: "0.0.0.0:${VLESS_PORT}"
   protocol:
     type: tls
     reality_targets:
@@ -194,7 +195,7 @@ install_shoes() {
           type: vless
           user_id: "${UUID}"
           udp_enabled: true
-- address: "[::]:${ANYTLS_PORT}"
+- address: "0.0.0.0:${ANYTLS_PORT}"
   protocol:
     type: tls
     tls_targets:
@@ -207,7 +208,7 @@ install_shoes() {
             - name: anylts
               password: "${PUBLIC_KEY}"
           udp_enabled: true
-- address: "[::]:${SS_PORT}"
+- address: "0.0.0.0:${SS_PORT}"
   protocol:
     type: shadowsocks
     cipher: "${SS_METHOD}"
