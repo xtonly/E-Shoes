@@ -142,13 +142,8 @@ install_shoes() {
     clear
     echo -e "${CYAN}============= 开始部署 Shoes 代理节点 =============${RESET}"
     
-    # 强制同步时间 (修复 EOF 的核心)
+    # 强制同步时间
     sync_system_time
-
-    sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
-    if [[ -f /etc/sysctl.conf ]]; then
-        sed -i '/net.ipv6.conf.all.disable_ipv6/d' /etc/sysctl.conf
-    fi
     
     download_shoes_smart "normal"
     mkdir -p "${SHOES_CONF_DIR}"
@@ -170,28 +165,25 @@ install_shoes() {
     PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
     SHID=$(openssl rand -hex 8)
 
-    # === 修改核心：完全抛弃核心自带的密码生成命令，使用纯净的 OpenSSL ===
     SS_METHOD="2022-blake3-aes-256-gcm"
     echo -e "${YELLOW}--> 正在生成 SS-2022 规范密码...${RESET}"
-    # 生成 32 字节并剔除所有换行符，确保是绝对干净的标准 Base64
     SS_PASSWORD=$(openssl rand -base64 32 | tr -d '\n' | tr -d '\r')
 
     echo -e "${YELLOW}--> 正在生成自签 TLS 证书...${RESET}"
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" >/dev/null 2>&1
 
-    # === 新增逻辑：动态判断 IPv6 环境以确定绑定地址 ===
-    echo -e "${YELLOW}--> 正在检测服务器网络栈环境...${RESET}"
+    # === 新增逻辑：基于当前网络状态动态判断 IPv6 环境 ===
+    echo -e "${YELLOW}--> 正在检测当前服务器网络栈环境...${RESET}"
     HOST_IPV6=$(get_public_ipv6)
     if [[ -n "$HOST_IPV6" ]]; then
         BIND_ADDR="[::]"
-        echo -e "${GREEN}检测到 IPv6 地址，将开启双栈监听 [::]${RESET}"
+        echo -e "${GREEN}检测到可用的 IPv6 环境，节点将配置为双栈监听 [::]${RESET}"
     else
         BIND_ADDR="0.0.0.0"
-        echo -e "${YELLOW}未检测到可用 IPv6，将仅监听 IPv4 防止核心 Panic${RESET}"
+        echo -e "${YELLOW}未检测到可用的 IPv6，节点将配置为仅监听 IPv4 防止核心 Panic${RESET}"
     fi
 
-    # 修复：动态绑定地址，完美兼容双栈与纯 IPv4 机器
     cat > "${SHOES_CONF_FILE}" <<EOF
 - address: "${BIND_ADDR}:${VLESS_PORT}"
   protocol:
@@ -254,7 +246,6 @@ EOF
         echo -e "${YELLOW}--> 正在获取公网 IP...${RESET}"
         
         HOST_IP=$(get_public_ipv4)
-        # HOST_IPV6 已经在上方检测完毕，直接复用变量
 
         if [[ -z "$HOST_IP" ]]; then
             echo -e "${RED}警告：无法自动获取 IPv4 地址，链接中可能为空。${RESET}"
@@ -263,7 +254,6 @@ EOF
             echo -e "${GREEN}成功获取 IPv4: ${HOST_IP}${RESET}"
         fi
 
-        # 组合生成最终链接
         SS_LINK_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0 | tr -d '\n')
 
         cat > "${SHOES_LINK_FILE}" <<EOF
@@ -370,7 +360,7 @@ service_menu() {
 show_main_menu() {
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 2.7                  ${RESET}"
+    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 2.8                  ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
