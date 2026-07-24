@@ -173,15 +173,17 @@ install_shoes() {
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" >/dev/null 2>&1
 
-    # === 新增逻辑：基于当前网络状态动态判断 IPv6 环境 ===
-    echo -e "${YELLOW}--> 正在检测当前服务器网络栈环境...${RESET}"
+    # === 新增逻辑：基于本地网卡状态动态判断 IPv6 环境 ===
+    echo -e "${YELLOW}--> 正在检测服务器网络栈环境...${RESET}"
     HOST_IPV6=$(get_public_ipv6)
-    if [[ -n "$HOST_IPV6" ]]; then
+    
+    # 核心修改：不再依赖公网连通性，只要网卡分配了 inet6 (包括本地环回)，绑定 [::] 即可生效
+    if ip a | grep -qw inet6; then
         BIND_ADDR="[::]"
-        echo -e "${GREEN}检测到可用的 IPv6 环境，节点将配置为双栈监听 [::]${RESET}"
+        echo -e "${GREEN}检测到本地已开启 IPv6 协议栈，节点将配置为双栈监听 [::]${RESET}"
     else
         BIND_ADDR="0.0.0.0"
-        echo -e "${YELLOW}未检测到可用的 IPv6，节点将配置为仅监听 IPv4 防止核心 Panic${RESET}"
+        echo -e "${YELLOW}系统底层未开启 IPv6，将仅监听 IPv4 防止核心 Panic${RESET}"
     fi
 
     cat > "${SHOES_CONF_FILE}" <<EOF
