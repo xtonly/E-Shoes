@@ -180,9 +180,20 @@ install_shoes() {
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" >/dev/null 2>&1
 
-    # 修复：将所有监听地址从 [::] 改为 0.0.0.0，防止在无 IPv6 环境下直接 Panic
+    # === 新增逻辑：动态判断 IPv6 环境以确定绑定地址 ===
+    echo -e "${YELLOW}--> 正在检测服务器网络栈环境...${RESET}"
+    HOST_IPV6=$(get_public_ipv6)
+    if [[ -n "$HOST_IPV6" ]]; then
+        BIND_ADDR="[::]"
+        echo -e "${GREEN}检测到 IPv6 地址，将开启双栈监听 [::]${RESET}"
+    else
+        BIND_ADDR="0.0.0.0"
+        echo -e "${YELLOW}未检测到可用 IPv6，将仅监听 IPv4 防止核心 Panic${RESET}"
+    fi
+
+    # 修复：动态绑定地址，完美兼容双栈与纯 IPv4 机器
     cat > "${SHOES_CONF_FILE}" <<EOF
-- address: "0.0.0.0:${VLESS_PORT}"
+- address: "${BIND_ADDR}:${VLESS_PORT}"
   protocol:
     type: tls
     reality_targets:
@@ -195,7 +206,7 @@ install_shoes() {
           type: vless
           user_id: "${UUID}"
           udp_enabled: true
-- address: "0.0.0.0:${ANYTLS_PORT}"
+- address: "${BIND_ADDR}:${ANYTLS_PORT}"
   protocol:
     type: tls
     tls_targets:
@@ -208,7 +219,7 @@ install_shoes() {
             - name: anylts
               password: "${PUBLIC_KEY}"
           udp_enabled: true
-- address: "0.0.0.0:${SS_PORT}"
+- address: "${BIND_ADDR}:${SS_PORT}"
   protocol:
     type: shadowsocks
     cipher: "${SS_METHOD}"
@@ -243,7 +254,7 @@ EOF
         echo -e "${YELLOW}--> 正在获取公网 IP...${RESET}"
         
         HOST_IP=$(get_public_ipv4)
-        HOST_IPV6=$(get_public_ipv6)
+        # HOST_IPV6 已经在上方检测完毕，直接复用变量
 
         if [[ -z "$HOST_IP" ]]; then
             echo -e "${RED}警告：无法自动获取 IPv4 地址，链接中可能为空。${RESET}"
@@ -359,7 +370,7 @@ service_menu() {
 show_main_menu() {
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 2.6                  ${RESET}"
+    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 2.7                  ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
