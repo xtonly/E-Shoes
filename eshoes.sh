@@ -15,6 +15,7 @@ SHOES_BIN="/usr/local/bin/shoes"
 SHOES_CONF_DIR="/etc/shoes"
 SHOES_CONF_FILE="${SHOES_CONF_DIR}/config.yaml"
 SHOES_LINK_FILE="${SHOES_CONF_DIR}/config.txt"
+SHOES_ENV_FILE="${SHOES_CONF_DIR}/.env"
 SYSTEMD_FILE="/etc/systemd/system/shoes.service"
 TMP_DIR="/tmp/shoesdl"
 
@@ -26,6 +27,32 @@ require_root() {
 # ================== 辅助函数 ==================
 check_installed() { [[ -f "$SHOES_BIN" ]] && [[ -f "$SYSTEMD_FILE" ]]; }
 check_running() { systemctl is-active --quiet shoes; }
+
+# === URL 编码函数 (用于证书编码) ===
+urlencode() {
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))" "$1"
+    else
+        # 降级方案：使用 od 和 awk 极速编码
+        echo "$1" | od -v -t x1 | awk '
+            BEGIN {
+                for (i=0;i<=255;i++) hex[sprintf("%02x",i)]=sprintf("%%%02X",i);
+                hex["2d"]="-"; hex["2e"]="."; hex["30"]="0"; hex["31"]="1"; hex["32"]="2"; hex["33"]="3";
+                hex["34"]="4"; hex["35"]="5"; hex["36"]="6"; hex["37"]="7"; hex["38"]="8"; hex["39"]="9";
+                hex["41"]="A"; hex["42"]="B"; hex["43"]="C"; hex["44"]="D"; hex["45"]="E"; hex["46"]="F";
+                hex["47"]="G"; hex["48"]="H"; hex["49"]="I"; hex["4a"]="J"; hex["4b"]="K"; hex["4c"]="L";
+                hex["4d"]="M"; hex["4e"]="N"; hex["4f"]="O"; hex["50"]="P"; hex["51"]="Q"; hex["52"]="R";
+                hex["53"]="S"; hex["54"]="T"; hex["55"]="U"; hex["56"]="V"; hex["57"]="W"; hex["58"]="X";
+                hex["59"]="Y"; hex["5a"]="Z"; hex["5f"]="_"; hex["61"]="a"; hex["62"]="b"; hex["63"]="c";
+                hex["64"]="d"; hex["65"]="e"; hex["66"]="f"; hex["67"]="g"; hex["68"]="h"; hex["69"]="i";
+                hex["6a"]="j"; hex["6b"]="k"; hex["6c"]="l"; hex["6d"]="m"; hex["6e"]="n"; hex["6f"]="o";
+                hex["70"]="p"; hex["71"]="q"; hex["72"]="r"; hex["73"]="s"; hex["74"]="t"; hex["75"]="u";
+                hex["76"]="v"; hex["77"]="w"; hex["78"]="x"; hex["79"]="y"; hex["7a"]="z"; hex["7e"]="~";
+            }
+            { for (i=2;i<=NF;i++) printf "%s", hex[$i] }
+        '
+    fi
+}
 
 # === 强制系统时间同步 ===
 sync_system_time() {
@@ -169,15 +196,30 @@ install_shoes() {
     echo -e "${YELLOW}--> 正在生成 SS-2022 规范密码...${RESET}"
     SS_PASSWORD=$(openssl rand -base64 32 | tr -d '\n' | tr -d '\r')
 
-    echo -e "${YELLOW}--> 正在生成自签 TLS 证书...${RESET}"
+    echo -e "${YELLOW}--> 正在生成自签 TLS 证书并提取编码...${RESET}"
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" >/dev/null 2>&1
+    
+    CERT_CONTENT=$(cat "${SHOES_CONF_DIR}/cert.pem")
+    CERT_ENCODED=$(urlencode "$CERT_CONTENT")
 
-    # === 新增逻辑：基于本地网卡状态动态判断 IPv6 环境 ===
+    # 保存环境参数以供后续证书更新使用
+    cat > "${SHOES_ENV_FILE}" <<EOF
+UUID="${UUID}"
+PUBLIC_KEY="${PUBLIC_KEY}"
+SHID="${SHID}"
+SS_METHOD="${SS_METHOD}"
+SS_PASSWORD="${SS_PASSWORD}"
+VLESS_PORT="${VLESS_PORT}"
+ANYTLS_PORT="${ANYTLS_PORT}"
+SS_PORT="${SS_PORT}"
+HOST_NAME="${HOST_NAME}"
+SNI="${SNI}"
+EOF
+
     echo -e "${YELLOW}--> 正在检测服务器网络栈环境...${RESET}"
     HOST_IPV6=$(get_public_ipv6)
     
-    # 核心修改：不再依赖公网连通性，只要网卡分配了 inet6 (包括本地环回)，绑定 [::] 即可生效
     if ip a | grep -qw inet6; then
         BIND_ADDR="[::]"
         echo -e "${GREEN}检测到本地已开启 IPv6 协议栈，节点将配置为双栈监听 [::]${RESET}"
@@ -262,7 +304,7 @@ EOF
 # Reality (IPv4)
 vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
 # AnyTLS (IPv4)
-anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&allowInsecure=1&type=tcp#${HOST_NAME}-Anytls
+anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&cert=${CERT_ENCODED}&type=tcp#${HOST_NAME}-Anytls
 # Shadowsocks-2022 (IPv4)
 ss://${SS_LINK_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS
 EOF
@@ -284,12 +326,13 @@ EOF
 # ================== 证书管理 ==================
 update_certificate() {
     echo -e "\n${YELLOW}--> 正在重新生成 TLS 证书...${RESET}"
-    if [[ ! -d "${SHOES_CONF_DIR}" ]]; then
-        echo -e "${RED}错误：配置目录不存在，请先安装 Shoes！${RESET}"
+    if [[ ! -d "${SHOES_CONF_DIR}" ]] || [[ ! -f "${SHOES_ENV_FILE}" ]]; then
+        echo -e "${RED}错误：配置目录不存在或缺失环境文件，请先进行安装部署！${RESET}"
         return
     fi
     
-    local SNI="updates.cdn-apple.com"
+    # 提取持久化的环境参数
+    source "${SHOES_ENV_FILE}"
     
     [[ -f "${SHOES_CONF_DIR}/key.pem" ]] && mv "${SHOES_CONF_DIR}/key.pem" "${SHOES_CONF_DIR}/key.pem.bak"
     [[ -f "${SHOES_CONF_DIR}/cert.pem" ]] && mv "${SHOES_CONF_DIR}/cert.pem" "${SHOES_CONF_DIR}/cert.pem.bak"
@@ -297,11 +340,33 @@ update_certificate() {
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" >/dev/null 2>&1
 
+    # 提取并编码新证书
+    CERT_CONTENT=$(cat "${SHOES_CONF_DIR}/cert.pem")
+    CERT_ENCODED=$(urlencode "$CERT_CONTENT")
+
     echo -e "${YELLOW}--> 正在重启服务以应用新证书...${RESET}"
     systemctl restart shoes
     
     if check_running; then
-        echo -e "${GREEN}服务已重启，新自签证书已生效。${RESET}"
+        echo -e "${GREEN}服务已重启，新自签证书已生效。正在更新节点链接...${RESET}"
+        
+        HOST_IP=$(get_public_ipv4)
+        HOST_IPV6=$(get_public_ipv6)
+        [[ -z "$HOST_IP" ]] && HOST_IP="YOUR_IPV4_HERE"
+        SS_LINK_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0 | tr -d '\n')
+        
+        cat > "${SHOES_LINK_FILE}" <<EOF
+# Reality (IPv4)
+vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
+# AnyTLS (IPv4) [已固定新证书]
+anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&cert=${CERT_ENCODED}&type=tcp#${HOST_NAME}-Anytls
+# Shadowsocks-2022 (IPv4)
+ss://${SS_LINK_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS
+EOF
+        if [[ -n "$HOST_IPV6" ]]; then
+            echo -e "\n# Reality (IPv6)\nvless://${UUID}@[${HOST_IPV6}]:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}-v6" >> "${SHOES_LINK_FILE}"
+        fi
+        echo -e "${GREEN}节点链接已同步更新！您可以返回主菜单查看。${RESET}"
     else
         echo -e "${RED}服务重启失败，请检查系统日志！${RESET}"
     fi
@@ -348,9 +413,9 @@ service_menu() {
         case "$sub_choice" in
             1) update_core; echo "" && read -n 1 -s -r -p "按任意键返回..." ;;
             2) uninstall_shoes; echo "" && read -n 1 -s -r -p "按任意键返回..." ;;
-            3) systemctl start shoes; echo -e "\n${GREEN}服务已启动${RESET}"; sleep 1 ;;
-            4) systemctl stop shoes; echo -e "\n${RED}服务已停止${RESET}"; sleep 1 ;;
-            5) systemctl restart shoes; echo -e "\n${GREEN}服务已重启${RESET}"; sleep 1 ;;
+            3) systemctl start shoes; echo -e "\n${GREEN}服务已启动${RESET}"; echo "" && read -n 1 -s -r -p "按任意键返回..." ;;
+            4) systemctl stop shoes; echo -e "\n${RED}服务已停止${RESET}"; echo "" && read -n 1 -s -r -p "按任意键返回..." ;;
+            5) systemctl restart shoes; echo -e "\n${GREEN}服务已重启${RESET}"; echo "" && read -n 1 -s -r -p "按任意键返回..." ;;
             6) update_certificate; echo "" && read -n 1 -s -r -p "按任意键返回..." ;;
             0) return ;;
             *) echo -e "${RED}无效选项，请重新输入！${RESET}"; sleep 1 ;;
