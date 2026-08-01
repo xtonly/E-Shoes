@@ -196,9 +196,10 @@ install_shoes() {
     echo -e "${YELLOW}--> 正在生成 SS-2022 规范密码...${RESET}"
     SS_PASSWORD=$(openssl rand -base64 32 | tr -d '\n' | tr -d '\r')
 
-    echo -e "${YELLOW}--> 正在生成自签 TLS 证书并提取编码...${RESET}"
+    echo -e "${YELLOW}--> 正在生成包含 SAN 扩展的自签 TLS 证书并提取编码...${RESET}"
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
-    openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" >/dev/null 2>&1
+    # 核心修改：追加 -addext "subjectAltName=DNS:${SNI}" 满足现代内核规范
+    openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" -addext "subjectAltName=DNS:${SNI}" >/dev/null 2>&1
     
     CERT_CONTENT=$(cat "${SHOES_CONF_DIR}/cert.pem")
     CERT_ENCODED=$(urlencode "$CERT_CONTENT")
@@ -338,7 +339,8 @@ update_certificate() {
     [[ -f "${SHOES_CONF_DIR}/cert.pem" ]] && mv "${SHOES_CONF_DIR}/cert.pem" "${SHOES_CONF_DIR}/cert.pem.bak"
 
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
-    openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" >/dev/null 2>&1
+    # 核心修改：追加 -addext "subjectAltName=DNS:${SNI}" 满足现代内核规范
+    openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" -addext "subjectAltName=DNS:${SNI}" >/dev/null 2>&1
 
     # 提取并编码新证书
     CERT_CONTENT=$(cat "${SHOES_CONF_DIR}/cert.pem")
@@ -427,7 +429,7 @@ service_menu() {
 show_main_menu() {
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 3.0                  ${RESET}"
+    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 3.1                  ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
