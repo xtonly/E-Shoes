@@ -28,32 +28,6 @@ require_root() {
 check_installed() { [[ -f "$SHOES_BIN" ]] && [[ -f "$SYSTEMD_FILE" ]]; }
 check_running() { systemctl is-active --quiet shoes; }
 
-# === URL 编码函数 (用于证书编码) ===
-urlencode() {
-    if command -v python3 >/dev/null 2>&1; then
-        python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))" "$1"
-    else
-        # 降级方案：使用 od 和 awk 极速编码
-        echo "$1" | od -v -t x1 | awk '
-            BEGIN {
-                for (i=0;i<=255;i++) hex[sprintf("%02x",i)]=sprintf("%%%02X",i);
-                hex["2d"]="-"; hex["2e"]="."; hex["30"]="0"; hex["31"]="1"; hex["32"]="2"; hex["33"]="3";
-                hex["34"]="4"; hex["35"]="5"; hex["36"]="6"; hex["37"]="7"; hex["38"]="8"; hex["39"]="9";
-                hex["41"]="A"; hex["42"]="B"; hex["43"]="C"; hex["44"]="D"; hex["45"]="E"; hex["46"]="F";
-                hex["47"]="G"; hex["48"]="H"; hex["49"]="I"; hex["4a"]="J"; hex["4b"]="K"; hex["4c"]="L";
-                hex["4d"]="M"; hex["4e"]="N"; hex["4f"]="O"; hex["50"]="P"; hex["51"]="Q"; hex["52"]="R";
-                hex["53"]="S"; hex["54"]="T"; hex["55"]="U"; hex["56"]="V"; hex["57"]="W"; hex["58"]="X";
-                hex["59"]="Y"; hex["5a"]="Z"; hex["5f"]="_"; hex["61"]="a"; hex["62"]="b"; hex["63"]="c";
-                hex["64"]="d"; hex["65"]="e"; hex["66"]="f"; hex["67"]="g"; hex["68"]="h"; hex["69"]="i";
-                hex["6a"]="j"; hex["6b"]="k"; hex["6c"]="l"; hex["6d"]="m"; hex["6e"]="n"; hex["6f"]="o";
-                hex["70"]="p"; hex["71"]="q"; hex["72"]="r"; hex["73"]="s"; hex["74"]="t"; hex["75"]="u";
-                hex["76"]="v"; hex["77"]="w"; hex["78"]="x"; hex["79"]="y"; hex["7a"]="z"; hex["7e"]="~";
-            }
-            { for (i=2;i<=NF;i++) printf "%s", hex[$i] }
-        '
-    fi
-}
-
 # === 强制系统时间同步 ===
 sync_system_time() {
     echo -e "${YELLOW}--> 正在强制同步服务器时间 (SS-2022 精准时间)...${RESET}"
@@ -196,14 +170,10 @@ install_shoes() {
     echo -e "${YELLOW}--> 正在生成 SS-2022 规范密码...${RESET}"
     SS_PASSWORD=$(openssl rand -base64 32 | tr -d '\n' | tr -d '\r')
 
-    echo -e "${YELLOW}--> 正在生成包含 SAN 扩展的自签 TLS 证书并提取编码...${RESET}"
+    echo -e "${YELLOW}--> 正在生成包含 SAN 扩展的自签 TLS 证书...${RESET}"
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
-    # 核心修改：追加 -addext "subjectAltName=DNS:${SNI}" 满足现代内核规范
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" -addext "subjectAltName=DNS:${SNI}" >/dev/null 2>&1
     
-    CERT_CONTENT=$(cat "${SHOES_CONF_DIR}/cert.pem")
-    CERT_ENCODED=$(urlencode "$CERT_CONTENT")
-
     # 保存环境参数以供后续证书更新使用
     cat > "${SHOES_ENV_FILE}" <<EOF
 UUID="${UUID}"
@@ -301,11 +271,12 @@ EOF
 
         SS_LINK_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0 | tr -d '\n')
 
+        # 生成节点链接（AnyTLS 恢复 allowInsecure=1 设置，便于客户端导入）
         cat > "${SHOES_LINK_FILE}" <<EOF
 # Reality (IPv4)
 vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
 # AnyTLS (IPv4)
-anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&cert=${CERT_ENCODED}&type=tcp#${HOST_NAME}-Anytls
+anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&allowInsecure=1&type=tcp#${HOST_NAME}-Anytls
 # Shadowsocks-2022 (IPv4)
 ss://${SS_LINK_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS
 EOF
@@ -339,12 +310,7 @@ update_certificate() {
     [[ -f "${SHOES_CONF_DIR}/cert.pem" ]] && mv "${SHOES_CONF_DIR}/cert.pem" "${SHOES_CONF_DIR}/cert.pem.bak"
 
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
-    # 核心修改：追加 -addext "subjectAltName=DNS:${SNI}" 满足现代内核规范
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" -addext "subjectAltName=DNS:${SNI}" >/dev/null 2>&1
-
-    # 提取并编码新证书
-    CERT_CONTENT=$(cat "${SHOES_CONF_DIR}/cert.pem")
-    CERT_ENCODED=$(urlencode "$CERT_CONTENT")
 
     echo -e "${YELLOW}--> 正在重启服务以应用新证书...${RESET}"
     systemctl restart shoes
@@ -360,8 +326,8 @@ update_certificate() {
         cat > "${SHOES_LINK_FILE}" <<EOF
 # Reality (IPv4)
 vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
-# AnyTLS (IPv4) [已固定新证书]
-anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&cert=${CERT_ENCODED}&type=tcp#${HOST_NAME}-Anytls
+# AnyTLS (IPv4)
+anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&allowInsecure=1&type=tcp#${HOST_NAME}-Anytls
 # Shadowsocks-2022 (IPv4)
 ss://${SS_LINK_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS
 EOF
@@ -429,7 +395,7 @@ service_menu() {
 show_main_menu() {
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 3.1                  ${RESET}"
+    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 3.0                  ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
