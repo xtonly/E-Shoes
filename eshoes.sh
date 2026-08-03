@@ -151,7 +151,7 @@ install_shoes() {
 
     HOST_NAME=$(hostname)
     [[ -z "$HOST_NAME" ]] && HOST_NAME="ShoeServer"
-    SNI="updates.cdn-apple.com"
+    SNI="icloud.com"
 
     VLESS_PORT=$(shuf -i 20000-60000 -n 1)
     ANYTLS_PORT=$(shuf -i 20000-60000 -n 1)
