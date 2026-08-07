@@ -174,6 +174,9 @@ install_shoes() {
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" -addext "subjectAltName=DNS:${SNI}" >/dev/null 2>&1
     
+    # 核心修改：计算证书的 SHA256 哈希值
+    CERT_HASH=$(openssl x509 -in "${SHOES_CONF_DIR}/cert.pem" -noout -fingerprint -sha256 | cut -d= -f2 | tr -d ':' | tr '[:upper:]' '[:lower:]')
+
     # 保存环境参数以供后续证书更新使用
     cat > "${SHOES_ENV_FILE}" <<EOF
 UUID="${UUID}"
@@ -271,12 +274,12 @@ EOF
 
         SS_LINK_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0 | tr -d '\n')
 
-        # 生成节点链接（AnyTLS 恢复 allowInsecure=1 设置，便于客户端导入）
+        # 生成节点链接（注入 certhash）
         cat > "${SHOES_LINK_FILE}" <<EOF
 # Reality (IPv4)
 vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
 # AnyTLS (IPv4)
-anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&allowInsecure=1&type=tcp#${HOST_NAME}-Anytls
+anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&certhash=${CERT_HASH}&type=tcp#${HOST_NAME}-Anytls
 # Shadowsocks-2022 (IPv4)
 ss://${SS_LINK_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS
 EOF
@@ -289,6 +292,11 @@ EOF
         echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
         cat "${SHOES_LINK_FILE}"
         echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
+        
+        # 终端专属提示
+        echo -e "\n${CYAN}【AnyTLS 专属提示 - 解决证书导入痛点】${RESET}"
+        echo -e "如果 V2rayN 导入链接后，【固定证书】处仍然为空，请直接复制并粘贴下方这 ${YELLOW}一短串哈希值${RESET} 进去即可："
+        echo -e "${GREEN}${CERT_HASH}${RESET}\n"
     else
         echo -e "${RED}服务启动失败！以下为调试信息：${RESET}"
         ${SHOES_BIN} ${SHOES_CONF_FILE}
@@ -312,6 +320,9 @@ update_certificate() {
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" -addext "subjectAltName=DNS:${SNI}" >/dev/null 2>&1
 
+    # 核心修改：重新计算新证书的 SHA256 哈希值
+    CERT_HASH=$(openssl x509 -in "${SHOES_CONF_DIR}/cert.pem" -noout -fingerprint -sha256 | cut -d= -f2 | tr -d ':' | tr '[:upper:]' '[:lower:]')
+
     echo -e "${YELLOW}--> 正在重启服务以应用新证书...${RESET}"
     systemctl restart shoes
     
@@ -327,7 +338,7 @@ update_certificate() {
 # Reality (IPv4)
 vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
 # AnyTLS (IPv4)
-anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&allowInsecure=1&type=tcp#${HOST_NAME}-Anytls
+anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&certhash=${CERT_HASH}&type=tcp#${HOST_NAME}-Anytls
 # Shadowsocks-2022 (IPv4)
 ss://${SS_LINK_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS
 EOF
@@ -335,6 +346,11 @@ EOF
             echo -e "\n# Reality (IPv6)\nvless://${UUID}@[${HOST_IPV6}]:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}-v6" >> "${SHOES_LINK_FILE}"
         fi
         echo -e "${GREEN}节点链接已同步更新！您可以返回主菜单查看。${RESET}"
+        
+        # 终端专属提示
+        echo -e "\n${CYAN}【AnyTLS 专属提示 - 解决证书导入痛点】${RESET}"
+        echo -e "如果 V2rayN 导入链接后，【固定证书】处仍然为空，请直接复制并粘贴下方这 ${YELLOW}一短串哈希值${RESET} 进去即可："
+        echo -e "${GREEN}${CERT_HASH}${RESET}\n"
     else
         echo -e "${RED}服务重启失败，请检查系统日志！${RESET}"
     fi
@@ -395,7 +411,7 @@ service_menu() {
 show_main_menu() {
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 3.0                  ${RESET}"
+    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 3.1                  ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
