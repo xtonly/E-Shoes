@@ -271,12 +271,12 @@ EOF
 
         SS_LINK_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0 | tr -d '\n')
 
-        # 生成节点链接（强制注入 allowInsecure=1 跳过证书验证）
+        # 生成节点链接（双重注入跳过证书验证参数，兼容不同解析器）
         cat > "${SHOES_LINK_FILE}" <<EOF
 # Reality (IPv4)
 vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
 # AnyTLS (IPv4)
-anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&allowInsecure=1&type=tcp#${HOST_NAME}-Anytls
+anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&allowInsecure=1&insecure=1&type=tcp#${HOST_NAME}-Anytls
 # Shadowsocks-2022 (IPv4)
 ss://${SS_LINK_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS
 EOF
@@ -323,11 +323,12 @@ update_certificate() {
         [[ -z "$HOST_IP" ]] && HOST_IP="YOUR_IPV4_HERE"
         SS_LINK_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0 | tr -d '\n')
         
+        # 生成节点链接（双重注入跳过证书验证参数，兼容不同解析器）
         cat > "${SHOES_LINK_FILE}" <<EOF
 # Reality (IPv4)
 vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
 # AnyTLS (IPv4)
-anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&allowInsecure=1&type=tcp#${HOST_NAME}-Anytls
+anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&allowInsecure=1&insecure=1&type=tcp#${HOST_NAME}-Anytls
 # Shadowsocks-2022 (IPv4)
 ss://${SS_LINK_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS
 EOF
@@ -395,7 +396,7 @@ service_menu() {
 show_main_menu() {
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 3.0                  ${RESET}"
+    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 3.1                  ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
