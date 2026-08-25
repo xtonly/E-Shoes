@@ -140,6 +140,7 @@ download_shoes_smart() {
 
 # ================== 核心安装逻辑 ==================
 install_shoes() {
+    local install_mode="$1" # 接收模式参数: "new" 或 "keep"
     clear
     echo -e "${CYAN}============= 开始部署 Shoes 代理节点 =============${RESET}"
     
@@ -149,34 +150,54 @@ install_shoes() {
     download_shoes_smart "normal"
     mkdir -p "${SHOES_CONF_DIR}"
 
-    HOST_NAME=$(hostname)
-    [[ -z "$HOST_NAME" ]] && HOST_NAME="ShoeServer"
-    SNI="icloud.com"
+    # 判断是否为保留模式且存在旧配置
+    if [[ "$install_mode" == "keep" ]] && [[ -f "${SHOES_ENV_FILE}" ]] && [[ -f "${SHOES_CONF_FILE}" ]]; then
+        echo -e "${GREEN}--> 正在读取现有配置文件，保留原有节点与端口信息...${RESET}"
+        source "${SHOES_ENV_FILE}"
+        
+        # 兼容旧版本：旧版环境文件可能没有记录 PRIVATE_KEY，需要从 yaml 中反向提取
+        if [[ -z "$PRIVATE_KEY" ]]; then
+            PRIVATE_KEY=$(grep 'private_key:' "${SHOES_CONF_FILE}" | head -n 1 | awk -F'"' '{print $2}')
+        fi
+        [[ -z "$HOST_NAME" ]] && HOST_NAME=$(hostname)
+        [[ -z "$SNI" ]] && SNI="icloud.com"
+        
+        SKIP_CERT=0
+        if [[ -f "${SHOES_CONF_DIR}/cert.pem" ]] && [[ -f "${SHOES_CONF_DIR}/key.pem" ]]; then
+            echo -e "${GREEN}--> 检测到现有 TLS 证书，跳过生成...${RESET}"
+            SKIP_CERT=1
+        fi
+    else
+        if [[ "$install_mode" == "keep" ]]; then
+            echo -e "${RED}警告：未检测到完整的旧配置环境，将自动执行全新安装！${RESET}"
+        fi
+        
+        echo -e "${YELLOW}--> 正在生成全新的安全密钥与端口...${RESET}"
+        HOST_NAME=$(hostname)
+        [[ -z "$HOST_NAME" ]] && HOST_NAME="ShoeServer"
+        SNI="icloud.com"
 
-    VLESS_PORT=$(shuf -i 20000-60000 -n 1)
-    ANYTLS_PORT=$(shuf -i 20000-60000 -n 1)
-    SS_PORT=$(shuf -i 20000-60000 -n 1)
-    while [[ "$ANYTLS_PORT" == "$VLESS_PORT" ]]; do ANYTLS_PORT=$(shuf -i 20000-60000 -n 1); done
-    while [[ "$SS_PORT" == "$VLESS_PORT" || "$SS_PORT" == "$ANYTLS_PORT" ]]; do SS_PORT=$(shuf -i 20000-60000 -n 1); done
+        VLESS_PORT=$(shuf -i 20000-60000 -n 1)
+        ANYTLS_PORT=$(shuf -i 20000-60000 -n 1)
+        SS_PORT=$(shuf -i 20000-60000 -n 1)
+        while [[ "$ANYTLS_PORT" == "$VLESS_PORT" ]]; do ANYTLS_PORT=$(shuf -i 20000-60000 -n 1); done
+        while [[ "$SS_PORT" == "$VLESS_PORT" || "$SS_PORT" == "$ANYTLS_PORT" ]]; do SS_PORT=$(shuf -i 20000-60000 -n 1); done
 
-    echo -e "${YELLOW}--> 正在生成安全密钥...${RESET}"
-    UUID=$(cat /proc/sys/kernel/random/uuid)
-    KEYPAIR=$(${SHOES_BIN} generate-reality-keypair)
-    PRIVATE_KEY=$(echo "$KEYPAIR" | grep "private key" | awk '{print $4}')
-    PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
-    SHID=$(openssl rand -hex 8)
+        UUID=$(cat /proc/sys/kernel/random/uuid)
+        KEYPAIR=$(${SHOES_BIN} generate-reality-keypair)
+        PRIVATE_KEY=$(echo "$KEYPAIR" | grep "private key" | awk '{print $4}')
+        PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
+        SHID=$(openssl rand -hex 8)
 
-    SS_METHOD="2022-blake3-aes-256-gcm"
-    echo -e "${YELLOW}--> 正在生成 SS-2022 规范密码...${RESET}"
-    SS_PASSWORD=$(openssl rand -base64 32 | tr -d '\n' | tr -d '\r')
+        SS_METHOD="2022-blake3-aes-256-gcm"
+        SS_PASSWORD=$(openssl rand -base64 32 | tr -d '\n' | tr -d '\r')
+        SKIP_CERT=0
+    fi
 
-    echo -e "${YELLOW}--> 正在生成包含 SAN 扩展的自签 TLS 证书...${RESET}"
-    openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
-    openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" -addext "subjectAltName=DNS:${SNI}" >/dev/null 2>&1
-    
-    # 保存环境参数以供后续证书更新使用
+    # 保存环境参数 (新版加入 PRIVATE_KEY 确保持久化)
     cat > "${SHOES_ENV_FILE}" <<EOF
 UUID="${UUID}"
+PRIVATE_KEY="${PRIVATE_KEY}"
 PUBLIC_KEY="${PUBLIC_KEY}"
 SHID="${SHID}"
 SS_METHOD="${SS_METHOD}"
@@ -187,6 +208,12 @@ SS_PORT="${SS_PORT}"
 HOST_NAME="${HOST_NAME}"
 SNI="${SNI}"
 EOF
+
+    if [[ "$SKIP_CERT" -eq 0 ]]; then
+        echo -e "${YELLOW}--> 正在生成包含 SAN 扩展的自签 TLS 证书...${RESET}"
+        openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
+        openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" -addext "subjectAltName=DNS:${SNI}" >/dev/null 2>&1
+    fi
 
     echo -e "${YELLOW}--> 正在检测服务器网络栈环境...${RESET}"
     HOST_IPV6=$(get_public_ipv6)
@@ -311,7 +338,12 @@ EOF
             echo -e "${GREEN}成功获取 IPv6: ${HOST_IPV6}${RESET}"
         fi
         
-        echo -e "\n${GREEN}Shoes 节点服务安装成功！${RESET}"
+        if [[ "$install_mode" == "keep" ]]; then
+             echo -e "\n${GREEN}Shoes 环境修复/优化成功！您的节点配置已完全保留！${RESET}"
+        else
+             echo -e "\n${GREEN}Shoes 节点服务全新安装成功！${RESET}"
+        fi
+        
         echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
         cat "${SHOES_LINK_FILE}"
         echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
@@ -349,7 +381,7 @@ update_certificate() {
         [[ -z "$HOST_IP" ]] && HOST_IP="YOUR_IPV4_HERE"
         SS_LINK_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0 | tr -d '\n')
         
-        # 生成节点链接（双重注入跳过证书验证参数，兼容不同解析器）
+        # 生成节点链接
         cat > "${SHOES_LINK_FILE}" <<EOF
 # Reality (IPv4)
 vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
@@ -429,10 +461,11 @@ show_main_menu() {
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
     echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
-    echo "  1. 安装/重置服务 (全新安装)"
-    echo "  2. 服务管理 (更新/卸载/启停)"
-    echo "  3. 查看节点链接配置"
-    echo "  4. 查看系统实时日志"
+    echo -e "  1. 全新安装/重置服务 (${RED}⚠️ 覆盖原有节点${RESET})"
+    echo -e "  2. 修复/优化系统环境 (${GREEN}✅ 保留原有节点${RESET})"
+    echo "  3. 服务管理 (更新/卸载/启停)"
+    echo "  4. 查看节点链接配置"
+    echo "  5. 查看系统实时日志"
     echo "  0. 退出脚本"
     echo -e "${MAGENTA}=========================================================${RESET}"
     read -p "  请输入对应的数字选项: " choice
@@ -444,13 +477,17 @@ while true; do
     show_main_menu
     case "$choice" in
         1) 
-            install_shoes
+            install_shoes "new"
             echo "" && read -n 1 -s -r -p "按任意键继续..." 
             ;;
         2) 
-            service_menu 
+            install_shoes "keep"
+            echo "" && read -n 1 -s -r -p "按任意键继续..." 
             ;;
         3) 
+            service_menu 
+            ;;
+        4) 
             echo -e "\n${CYAN}--- 当前节点配置链接 ---${RESET}"
             if [[ -f "${SHOES_LINK_FILE}" ]]; then
                 cat "${SHOES_LINK_FILE}"
@@ -459,7 +496,7 @@ while true; do
             fi
             echo "" && read -n 1 -s -r -p "按任意键继续..." 
             ;;
-        4) 
+        5) 
             echo -e "\n${YELLOW}--> 按 Ctrl+C 退出日志查看${RESET}"
             journalctl -u shoes -f 
             ;;
