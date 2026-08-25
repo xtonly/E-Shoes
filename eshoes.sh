@@ -234,6 +234,7 @@ EOF
     udp_enabled: true
 EOF
 
+    # 生成 systemd 单元文件，设置高文件描述符上限并过滤调试日志
     cat > "${SYSTEMD_FILE}" <<EOF
 [Unit]
 Description=Shoes Proxy Server
@@ -243,13 +244,38 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=${SHOES_CONF_DIR}
+Environment="RUST_LOG=warn"
 ExecStart=${SHOES_BIN} ${SHOES_CONF_FILE}
 Restart=on-failure
 RestartSec=3
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
+    # 配置系统级文件描述符与网络优化
+    echo -e "${YELLOW}--> 正在优化系统级文件描述符与网络参数...${RESET}"
+    cat > /etc/security/limits.d/99-shoes-fd.conf <<EOF
+* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+EOF
+
+    cat > /etc/sysctl.d/99-shoes-net.conf <<EOF
+fs.file-max = 1048576
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_probes = 3
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_max_tw_buckets = 5000
+net.ipv4.tcp_tw_reuse = 1
+EOF
+    sysctl --system >/dev/null 2>&1
 
     echo -e "${YELLOW}--> 正在注册并启动系统服务...${RESET}"
     systemctl daemon-reload
@@ -357,6 +383,8 @@ uninstall_shoes() {
     rm -f "${SYSTEMD_FILE}"
     rm -rf "${SHOES_CONF_DIR}"
     rm -f "${SHOES_BIN}"
+    rm -f /etc/security/limits.d/99-shoes-fd.conf
+    rm -f /etc/sysctl.d/99-shoes-net.conf
     systemctl daemon-reload
     echo -e "${GREEN}Shoes 及其相关配置已完全卸载。${RESET}"
 }
@@ -396,7 +424,7 @@ service_menu() {
 show_main_menu() {
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 3.1                  ${RESET}"
+    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 3.2                  ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
