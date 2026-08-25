@@ -194,7 +194,7 @@ install_shoes() {
         SKIP_CERT=0
     fi
 
-    # 保存环境参数 (新版加入 PRIVATE_KEY 确保持久化)
+    # 保存环境参数
     cat > "${SHOES_ENV_FILE}" <<EOF
 UUID="${UUID}"
 PRIVATE_KEY="${PRIVATE_KEY}"
@@ -261,7 +261,7 @@ EOF
     udp_enabled: true
 EOF
 
-    # 生成 systemd 单元文件，设置高文件描述符上限并过滤调试日志
+    # 生成 systemd 单元文件，设置高文件描述符上限并精准过滤底层错误日志
     cat > "${SYSTEMD_FILE}" <<EOF
 [Unit]
 Description=Shoes Proxy Server
@@ -271,7 +271,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=${SHOES_CONF_DIR}
-Environment="RUST_LOG=warn"
+Environment="RUST_LOG=error,shoes::tcp::tcp_server=off"
 ExecStart=${SHOES_BIN} ${SHOES_CONF_FILE}
 Restart=on-failure
 RestartSec=3
@@ -324,7 +324,7 @@ EOF
 
         SS_LINK_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0 | tr -d '\n')
 
-        # 生成节点链接（双重注入跳过证书验证参数，兼容不同解析器）
+        # 生成节点链接
         cat > "${SHOES_LINK_FILE}" <<EOF
 # Reality (IPv4)
 vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
@@ -456,7 +456,7 @@ service_menu() {
 show_main_menu() {
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 3.2                  ${RESET}"
+    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 3.3                  ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
