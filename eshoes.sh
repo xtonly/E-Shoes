@@ -159,6 +159,12 @@ install_shoes() {
         if [[ -z "$PRIVATE_KEY" ]]; then
             PRIVATE_KEY=$(grep 'private_key:' "${SHOES_CONF_FILE}" | head -n 1 | awk -F'"' '{print $2}')
         fi
+        
+        # 兼容旧版本：将 ANYTLS_PORT 映射到 TROJAN_PORT
+        if [[ -z "$TROJAN_PORT" ]] && [[ -n "$ANYTLS_PORT" ]]; then
+            TROJAN_PORT="$ANYTLS_PORT"
+        fi
+
         [[ -z "$HOST_NAME" ]] && HOST_NAME=$(hostname)
         [[ -z "$SNI" ]] && SNI="icloud.com"
         
@@ -178,10 +184,10 @@ install_shoes() {
         SNI="icloud.com"
 
         VLESS_PORT=$(shuf -i 20000-60000 -n 1)
-        ANYTLS_PORT=$(shuf -i 20000-60000 -n 1)
+        TROJAN_PORT=$(shuf -i 20000-60000 -n 1)
         SS_PORT=$(shuf -i 20000-60000 -n 1)
-        while [[ "$ANYTLS_PORT" == "$VLESS_PORT" ]]; do ANYTLS_PORT=$(shuf -i 20000-60000 -n 1); done
-        while [[ "$SS_PORT" == "$VLESS_PORT" || "$SS_PORT" == "$ANYTLS_PORT" ]]; do SS_PORT=$(shuf -i 20000-60000 -n 1); done
+        while [[ "$TROJAN_PORT" == "$VLESS_PORT" ]]; do TROJAN_PORT=$(shuf -i 20000-60000 -n 1); done
+        while [[ "$SS_PORT" == "$VLESS_PORT" || "$SS_PORT" == "$TROJAN_PORT" ]]; do SS_PORT=$(shuf -i 20000-60000 -n 1); done
 
         UUID=$(cat /proc/sys/kernel/random/uuid)
         KEYPAIR=$(${SHOES_BIN} generate-reality-keypair)
@@ -203,12 +209,13 @@ SHID="${SHID}"
 SS_METHOD="${SS_METHOD}"
 SS_PASSWORD="${SS_PASSWORD}"
 VLESS_PORT="${VLESS_PORT}"
-ANYTLS_PORT="${ANYTLS_PORT}"
+TROJAN_PORT="${TROJAN_PORT}"
 SS_PORT="${SS_PORT}"
 HOST_NAME="${HOST_NAME}"
 SNI="${SNI}"
 EOF
 
+    # 虽然 REALITY 不再需要自签证书，保留生成逻辑以免破坏原有脚本依赖检查
     if [[ "$SKIP_CERT" -eq 0 ]]; then
         echo -e "${YELLOW}--> 正在生成包含 SAN 扩展的自签 TLS 证书...${RESET}"
         openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
@@ -240,17 +247,18 @@ EOF
           type: vless
           user_id: "${UUID}"
           udp_enabled: true
-- address: "${BIND_ADDR}:${ANYTLS_PORT}"
+- address: "${BIND_ADDR}:${TROJAN_PORT}"
   protocol:
     type: tls
-    tls_targets:
+    reality_targets:
       "${SNI}":
-        cert: "${SHOES_CONF_DIR}/cert.pem"
-        key: "${SHOES_CONF_DIR}/key.pem"
+        private_key: "${PRIVATE_KEY}"
+        short_ids: ["${SHID}"]
+        dest: "${SNI}:443"
         protocol:
-          type: anytls
+          type: trojan
           users:
-            - name: anylts
+            - name: trojan
               password: "${PUBLIC_KEY}"
           udp_enabled: true
 - address: "${BIND_ADDR}:${SS_PORT}"
@@ -328,13 +336,14 @@ EOF
         cat > "${SHOES_LINK_FILE}" <<EOF
 # Reality (IPv4)
 vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
-# AnyTLS (IPv4)
-anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&allowInsecure=1&insecure=1&type=tcp#${HOST_NAME}-Anytls
+# Trojan-REALITY (IPv4)
+trojan://${PUBLIC_KEY}@${HOST_IP}:${TROJAN_PORT}?security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}-Trojan
 # Shadowsocks-2022 (IPv4)
 ss://${SS_LINK_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS
 EOF
         if [[ -n "$HOST_IPV6" ]]; then
             echo -e "\n# Reality (IPv6)\nvless://${UUID}@[${HOST_IPV6}]:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}-v6" >> "${SHOES_LINK_FILE}"
+            echo -e "# Trojan-REALITY (IPv6)\ntrojan://${PUBLIC_KEY}@[${HOST_IPV6}]:${TROJAN_PORT}?security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}-Trojan-v6" >> "${SHOES_LINK_FILE}"
             echo -e "${GREEN}成功获取 IPv6: ${HOST_IPV6}${RESET}"
         fi
         
@@ -385,13 +394,14 @@ update_certificate() {
         cat > "${SHOES_LINK_FILE}" <<EOF
 # Reality (IPv4)
 vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
-# AnyTLS (IPv4)
-anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&allowInsecure=1&insecure=1&type=tcp#${HOST_NAME}-Anytls
+# Trojan-REALITY (IPv4)
+trojan://${PUBLIC_KEY}@${HOST_IP}:${TROJAN_PORT}?security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}-Trojan
 # Shadowsocks-2022 (IPv4)
 ss://${SS_LINK_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS
 EOF
         if [[ -n "$HOST_IPV6" ]]; then
             echo -e "\n# Reality (IPv6)\nvless://${UUID}@[${HOST_IPV6}]:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}-v6" >> "${SHOES_LINK_FILE}"
+            echo -e "# Trojan-REALITY (IPv6)\ntrojan://${PUBLIC_KEY}@[${HOST_IPV6}]:${TROJAN_PORT}?security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}-Trojan-v6" >> "${SHOES_LINK_FILE}"
         fi
         echo -e "${GREEN}节点链接已同步更新！您可以返回主菜单查看。${RESET}"
     else
@@ -456,7 +466,7 @@ service_menu() {
 show_main_menu() {
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 3.3                  ${RESET}"
+    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 3.3 (Trojan版)       ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
