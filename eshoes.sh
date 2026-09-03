@@ -278,19 +278,19 @@ WantedBy=multi-user.target
 EOF
 
     echo -e "${YELLOW}--> 正在优化系统级文件描述符与网络参数...${RESET}"
-    cat > /etc/security/limits.d/99-shoes-fd.conf <<EOF
-* soft nofile 1048576
-* hard nofile 1048576
-root soft nofile 1048576
-root hard nofile 1048576
+    cat > /etc/security/limits.d/99-bbr-optimization.conf <<EOF
+* soft nofile 65535
+* hard nofile 104857
+root soft nofile 65535
+root hard nofile 104857
 EOF
 
-    cat > /etc/sysctl.d/99-shoes-net.conf <<EOF
-fs.file-max = 1048576
+    cat > /etc/sysctl.d/99-bbr-optimization.conf << 'EOF'
+fs.file-max = 200000
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_keepalive_probes = 3
 net.ipv4.tcp_keepalive_intvl = 15
 net.ipv4.tcp_fin_timeout = 15
