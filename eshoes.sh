@@ -140,27 +140,24 @@ download_shoes_smart() {
 
 # ================== 核心安装逻辑 ==================
 install_shoes() {
-    local install_mode="$1" # 接收模式参数: "new" 或 "keep"
+    local install_mode="$1"
     clear
-    echo -e "${CYAN}============= 开始部署 Shoes 代理节点 =============${RESET}"
+    echo -e "${CYAN}============= 开始部署 Shoes 代理节点 (Trojan版) =============${RESET}"
     
-    # 强制同步时间
     sync_system_time
-    
     download_shoes_smart "normal"
     mkdir -p "${SHOES_CONF_DIR}"
 
-    # 判断是否为保留模式且存在旧配置
     if [[ "$install_mode" == "keep" ]] && [[ -f "${SHOES_ENV_FILE}" ]] && [[ -f "${SHOES_CONF_FILE}" ]]; then
         echo -e "${GREEN}--> 正在读取现有配置文件，保留原有节点与端口信息...${RESET}"
         source "${SHOES_ENV_FILE}"
         
-        # 兼容旧版本：旧版环境文件可能没有记录 PRIVATE_KEY，需要从 yaml 中反向提取
+        # 兼容旧版本提取私钥
         if [[ -z "$PRIVATE_KEY" ]]; then
             PRIVATE_KEY=$(grep 'private_key:' "${SHOES_CONF_FILE}" | head -n 1 | awk -F'"' '{print $2}')
         fi
         
-        # 兼容旧版本：将 ANYTLS_PORT 映射到 TROJAN_PORT
+        # 平滑过渡旧配置的端口
         if [[ -z "$TROJAN_PORT" ]] && [[ -n "$ANYTLS_PORT" ]]; then
             TROJAN_PORT="$ANYTLS_PORT"
         fi
@@ -168,11 +165,8 @@ install_shoes() {
         [[ -z "$HOST_NAME" ]] && HOST_NAME=$(hostname)
         [[ -z "$SNI" ]] && SNI="icloud.com"
         
-        SKIP_CERT=0
-        if [[ -f "${SHOES_CONF_DIR}/cert.pem" ]] && [[ -f "${SHOES_CONF_DIR}/key.pem" ]]; then
-            echo -e "${GREEN}--> 检测到现有 TLS 证书，跳过生成...${RESET}"
-            SKIP_CERT=1
-        fi
+        # Trojan-REALITY 已不再需要自签证书，直接跳过生成
+        SKIP_CERT=1
     else
         if [[ "$install_mode" == "keep" ]]; then
             echo -e "${RED}警告：未检测到完整的旧配置环境，将自动执行全新安装！${RESET}"
@@ -197,10 +191,10 @@ install_shoes() {
 
         SS_METHOD="2022-blake3-aes-256-gcm"
         SS_PASSWORD=$(openssl rand -base64 32 | tr -d '\n' | tr -d '\r')
-        SKIP_CERT=0
+        SKIP_CERT=1
     fi
 
-    # 保存环境参数
+    # 保存新的环境参数 (剔除了所有 anytls)
     cat > "${SHOES_ENV_FILE}" <<EOF
 UUID="${UUID}"
 PRIVATE_KEY="${PRIVATE_KEY}"
@@ -215,16 +209,10 @@ HOST_NAME="${HOST_NAME}"
 SNI="${SNI}"
 EOF
 
-    # 虽然 REALITY 不再需要自签证书，保留生成逻辑以免破坏原有脚本依赖检查
-    if [[ "$SKIP_CERT" -eq 0 ]]; then
-        echo -e "${YELLOW}--> 正在生成包含 SAN 扩展的自签 TLS 证书...${RESET}"
-        openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
-        openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" -addext "subjectAltName=DNS:${SNI}" >/dev/null 2>&1
-    fi
-
     echo -e "${YELLOW}--> 正在检测服务器网络栈环境...${RESET}"
     HOST_IPV6=$(get_public_ipv6)
     
+    # 根据用户之前的修正历史，脚本只应检查而不应强制更改 IPv6 状态
     if ip a | grep -qw inet6; then
         BIND_ADDR="[::]"
         echo -e "${GREEN}检测到本地已开启 IPv6 协议栈，节点将配置为双栈监听 [::]${RESET}"
@@ -233,6 +221,8 @@ EOF
         echo -e "${YELLOW}系统底层未开启 IPv6，将仅监听 IPv4 防止核心 Panic${RESET}"
     fi
 
+    # ================= 配置文件写入 =================
+    # 彻底删除了 AnyTLS，直接采用 Trojan-REALITY，扁平化设置 password 修复报错
     cat > "${SHOES_CONF_FILE}" <<EOF
 - address: "${BIND_ADDR}:${VLESS_PORT}"
   protocol:
@@ -257,9 +247,7 @@ EOF
         dest: "${SNI}:443"
         protocol:
           type: trojan
-          users:
-            - name: trojan
-              password: "${PUBLIC_KEY}"
+          password: "${PUBLIC_KEY}"
           udp_enabled: true
 - address: "${BIND_ADDR}:${SS_PORT}"
   protocol:
@@ -269,7 +257,7 @@ EOF
     udp_enabled: true
 EOF
 
-    # 生成 systemd 单元文件，设置高文件描述符上限并精准过滤底层错误日志
+    # 生成 systemd
     cat > "${SYSTEMD_FILE}" <<EOF
 [Unit]
 Description=Shoes Proxy Server
@@ -289,7 +277,6 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
 
-    # 配置系统级文件描述符与网络优化
     echo -e "${YELLOW}--> 正在优化系统级文件描述符与网络参数...${RESET}"
     cat > /etc/security/limits.d/99-shoes-fd.conf <<EOF
 * soft nofile 1048576
@@ -362,53 +349,6 @@ EOF
     fi
 }
 
-# ================== 证书管理 ==================
-update_certificate() {
-    echo -e "\n${YELLOW}--> 正在重新生成 TLS 证书...${RESET}"
-    if [[ ! -d "${SHOES_CONF_DIR}" ]] || [[ ! -f "${SHOES_ENV_FILE}" ]]; then
-        echo -e "${RED}错误：配置目录不存在或缺失环境文件，请先进行安装部署！${RESET}"
-        return
-    fi
-    
-    # 提取持久化的环境参数
-    source "${SHOES_ENV_FILE}"
-    
-    [[ -f "${SHOES_CONF_DIR}/key.pem" ]] && mv "${SHOES_CONF_DIR}/key.pem" "${SHOES_CONF_DIR}/key.pem.bak"
-    [[ -f "${SHOES_CONF_DIR}/cert.pem" ]] && mv "${SHOES_CONF_DIR}/cert.pem" "${SHOES_CONF_DIR}/cert.pem.bak"
-
-    openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
-    openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" -addext "subjectAltName=DNS:${SNI}" >/dev/null 2>&1
-
-    echo -e "${YELLOW}--> 正在重启服务以应用新证书...${RESET}"
-    systemctl restart shoes
-    
-    if check_running; then
-        echo -e "${GREEN}服务已重启，新自签证书已生效。正在更新节点链接...${RESET}"
-        
-        HOST_IP=$(get_public_ipv4)
-        HOST_IPV6=$(get_public_ipv6)
-        [[ -z "$HOST_IP" ]] && HOST_IP="YOUR_IPV4_HERE"
-        SS_LINK_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0 | tr -d '\n')
-        
-        # 生成节点链接
-        cat > "${SHOES_LINK_FILE}" <<EOF
-# Reality (IPv4)
-vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
-# Trojan-REALITY (IPv4)
-trojan://${PUBLIC_KEY}@${HOST_IP}:${TROJAN_PORT}?security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}-Trojan
-# Shadowsocks-2022 (IPv4)
-ss://${SS_LINK_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS
-EOF
-        if [[ -n "$HOST_IPV6" ]]; then
-            echo -e "\n# Reality (IPv6)\nvless://${UUID}@[${HOST_IPV6}]:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}-v6" >> "${SHOES_LINK_FILE}"
-            echo -e "# Trojan-REALITY (IPv6)\ntrojan://${PUBLIC_KEY}@[${HOST_IPV6}]:${TROJAN_PORT}?security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}-Trojan-v6" >> "${SHOES_LINK_FILE}"
-        fi
-        echo -e "${GREEN}节点链接已同步更新！您可以返回主菜单查看。${RESET}"
-    else
-        echo -e "${RED}服务重启失败，请检查系统日志！${RESET}"
-    fi
-}
-
 # ================== 服务管理子菜单 ==================
 update_core() {
     echo -e "\n${YELLOW}--> 正在更新 Shoes 核心...${RESET}"
@@ -444,7 +384,6 @@ service_menu() {
         echo "  3. 启动服务"
         echo "  4. 停止服务"
         echo "  5. 重启服务"
-        echo "  6. 更新 TLS 证书 (自签证书)"
         echo "  0. 返回主菜单"
         echo -e "${MAGENTA}=========================================================${RESET}"
         read -p "  请输入对应的数字选项: " sub_choice
@@ -455,7 +394,6 @@ service_menu() {
             3) systemctl start shoes; echo -e "\n${GREEN}服务已启动${RESET}"; echo "" && read -n 1 -s -r -p "按任意键返回..." ;;
             4) systemctl stop shoes; echo -e "\n${RED}服务已停止${RESET}"; echo "" && read -n 1 -s -r -p "按任意键返回..." ;;
             5) systemctl restart shoes; echo -e "\n${GREEN}服务已重启${RESET}"; echo "" && read -n 1 -s -r -p "按任意键返回..." ;;
-            6) update_certificate; echo "" && read -n 1 -s -r -p "按任意键返回..." ;;
             0) return ;;
             *) echo -e "${RED}无效选项，请重新输入！${RESET}"; sleep 1 ;;
         esac
@@ -466,7 +404,7 @@ service_menu() {
 show_main_menu() {
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 3.3 (Trojan版)       ${RESET}"
+    echo -e "${CYAN}        E-Shoes 代理节点一键管理脚本 3.4 (Trojan-REALITY版)   ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
