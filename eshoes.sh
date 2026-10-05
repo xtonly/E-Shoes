@@ -91,7 +91,7 @@ check_arch() {
 }
 
 get_latest_version() {
-    LATEST_VER=$(curl -s https://api.github.com/repos/cfal/shoes/releases/latest \
+    LATEST_VER=$(curl -s --connect-timeout 10 https://api.github.com/repos/cfal/shoes/releases/latest \
         | grep '"tag_name":' \
         | sed -E 's/.*"v?([^"]+)".*/\1/')
     [[ -z "$LATEST_VER" ]] && {
@@ -120,30 +120,34 @@ download_shoes_smart() {
     cd "${TMP_DIR}" || exit 1
 
     echo -e "${YELLOW}--> 尝试下载 GNU 版本 (v${LATEST_VER})...${RESET}"
-    wget -qO shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${GNU_FILE}"
-    tar -xzf shoes.tar.gz
-    mv shoes "${SHOES_BIN}"
-    chmod +x "${SHOES_BIN}"
-
-    if ${SHOES_BIN} --version >/dev/null 2>&1; then
-        echo -e "${GREEN}GNU 版本运行正常！版本: $(${SHOES_BIN} --version)${RESET}"
-        return
+    # 修改处：增加 --timeout 和 --tries 限制，并去掉 -q 以显示下载进度，防止卡死
+    wget --timeout=15 --tries=3 -O shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${GNU_FILE}"
+    
+    if [[ -f shoes.tar.gz ]] && tar -xzf shoes.tar.gz 2>/dev/null; then
+        mv shoes "${SHOES_BIN}"
+        chmod +x "${SHOES_BIN}"
+        if ${SHOES_BIN} --version >/dev/null 2>&1; then
+            echo -e "${GREEN}GNU 版本运行正常！版本: $(${SHOES_BIN} --version)${RESET}"
+            return
+        fi
     fi
 
-    echo -e "${RED}GNU 版本无法运行，自动切换 MUSL 版本...${RESET}"
-    rm -f "${SHOES_BIN}"
-    wget -qO shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${MUSL_FILE}"
-    tar -xzf shoes.tar.gz
-    mv shoes "${SHOES_BIN}"
-    chmod +x "${SHOES_BIN}"
-
-    if ${SHOES_BIN} --version >/dev/null 2>&1; then
-        echo -e "${GREEN}MUSL 版本运行正常！版本: $(${SHOES_BIN} --version)${RESET}"
-        return
-    else
-        echo -e "${RED}严重错误：所有版本均无法运行！请检查系统环境。${RESET}"
-        exit 1
+    echo -e "${RED}GNU 版本下载失败或无法运行，自动切换 MUSL 版本...${RESET}"
+    rm -f "${SHOES_BIN}" shoes.tar.gz
+    # 修改处：同上，增加超时和重试限制
+    wget --timeout=15 --tries=3 -O shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${MUSL_FILE}"
+    
+    if [[ -f shoes.tar.gz ]] && tar -xzf shoes.tar.gz 2>/dev/null; then
+        mv shoes "${SHOES_BIN}"
+        chmod +x "${SHOES_BIN}"
+        if ${SHOES_BIN} --version >/dev/null 2>&1; then
+            echo -e "${GREEN}MUSL 版本运行正常！版本: $(${SHOES_BIN} --version)${RESET}"
+            return
+        fi
     fi
+    
+    echo -e "${RED}严重错误：所有版本下载均失败或无法运行！请检查服务器网络与 GitHub 的连接状况。${RESET}"
+    exit 1
 }
 
 # ================== 核心安装逻辑 ==================
@@ -188,6 +192,7 @@ install_shoes() {
         while [[ "$SS_PORT" == "$VLESS_PORT" || "$SS_PORT" == "$ANYTLS_PORT" ]]; do SS_PORT=$(shuf -i 20000-60000 -n 1); done
 
         UUID=$(cat /proc/sys/kernel/random/uuid)
+        # 注意：此处必须用兼容方式或直接调用鞋子内置命令
         KEYPAIR=$(${SHOES_BIN} generate-reality-keypair)
         PRIVATE_KEY=$(echo "$KEYPAIR" | grep "private key" | awk '{print $4}')
         PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
@@ -456,7 +461,7 @@ service_menu() {
 show_main_menu() {
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 3.4                  ${RESET}"
+    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 3.5                    ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}核心版本:${RESET} $(get_local_version)"
