@@ -456,7 +456,7 @@ service_menu() {
 show_main_menu() {
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}              E-Shoes 代理节点一键管理脚本 3.4                ${RESET}"
+    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 3.4                  ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}核心版本:${RESET} $(get_local_version)"
