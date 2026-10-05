@@ -28,6 +28,14 @@ require_root() {
 check_installed() { [[ -f "$SHOES_BIN" ]] && [[ -f "$SYSTEMD_FILE" ]]; }
 check_running() { systemctl is-active --quiet shoes; }
 
+get_local_version() {
+    if [[ -x "$SHOES_BIN" ]]; then
+        "$SHOES_BIN" --version 2>/dev/null | awk '{print $2}' || echo "未知"
+    else
+        echo "未安装"
+    fi
+}
+
 # === 强制系统时间同步 ===
 sync_system_time() {
     echo -e "${YELLOW}--> 正在强制同步服务器时间 (SS-2022 精准时间)...${RESET}"
@@ -99,8 +107,8 @@ download_shoes_smart() {
     
     if [[ "$force_update" != "force" ]] && [[ -f "${SHOES_BIN}" ]]; then
         chmod +x "${SHOES_BIN}"
-        if ${SHOES_BIN} generate-reality-keypair >/dev/null 2>&1; then
-            echo -e "${GREEN}检测到当前核心可用，跳过下载。${RESET}"
+        if ${SHOES_BIN} --version >/dev/null 2>&1; then
+            echo -e "${GREEN}检测到当前核心可用 ($(get_local_version))，跳过下载。${RESET}"
             return
         fi
     fi
@@ -117,8 +125,8 @@ download_shoes_smart() {
     mv shoes "${SHOES_BIN}"
     chmod +x "${SHOES_BIN}"
 
-    if ${SHOES_BIN} generate-reality-keypair >/dev/null 2>&1; then
-        echo -e "${GREEN}GNU 版本运行正常！${RESET}"
+    if ${SHOES_BIN} --version >/dev/null 2>&1; then
+        echo -e "${GREEN}GNU 版本运行正常！版本: $(${SHOES_BIN} --version)${RESET}"
         return
     fi
 
@@ -129,8 +137,8 @@ download_shoes_smart() {
     mv shoes "${SHOES_BIN}"
     chmod +x "${SHOES_BIN}"
 
-    if ${SHOES_BIN} generate-reality-keypair >/dev/null 2>&1; then
-        echo -e "${GREEN}MUSL 版本运行正常！${RESET}"
+    if ${SHOES_BIN} --version >/dev/null 2>&1; then
+        echo -e "${GREEN}MUSL 版本运行正常！版本: $(${SHOES_BIN} --version)${RESET}"
         return
     else
         echo -e "${RED}严重错误：所有版本均无法运行！请检查系统环境。${RESET}"
@@ -140,22 +148,18 @@ download_shoes_smart() {
 
 # ================== 核心安装逻辑 ==================
 install_shoes() {
-    local install_mode="$1" # 接收模式参数: "new" 或 "keep"
+    local install_mode="$1"
     clear
     echo -e "${CYAN}============= 开始部署 Shoes 代理节点 =============${RESET}"
     
-    # 强制同步时间
     sync_system_time
-    
     download_shoes_smart "normal"
     mkdir -p "${SHOES_CONF_DIR}"
 
-    # 判断是否为保留模式且存在旧配置
     if [[ "$install_mode" == "keep" ]] && [[ -f "${SHOES_ENV_FILE}" ]] && [[ -f "${SHOES_CONF_FILE}" ]]; then
         echo -e "${GREEN}--> 正在读取现有配置文件，保留原有节点与端口信息...${RESET}"
         source "${SHOES_ENV_FILE}"
         
-        # 兼容旧版本：旧版环境文件可能没有记录 PRIVATE_KEY，需要从 yaml 中反向提取
         if [[ -z "$PRIVATE_KEY" ]]; then
             PRIVATE_KEY=$(grep 'private_key:' "${SHOES_CONF_FILE}" | head -n 1 | awk -F'"' '{print $2}')
         fi
@@ -194,7 +198,6 @@ install_shoes() {
         SKIP_CERT=0
     fi
 
-    # 保存环境参数
     cat > "${SHOES_ENV_FILE}" <<EOF
 UUID="${UUID}"
 PRIVATE_KEY="${PRIVATE_KEY}"
@@ -261,7 +264,6 @@ EOF
     udp_enabled: true
 EOF
 
-    # 生成 systemd 单元文件，设置高文件描述符上限并精准过滤底层错误日志
     cat > "${SYSTEMD_FILE}" <<EOF
 [Unit]
 Description=Shoes Proxy Server
@@ -281,7 +283,6 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
 
-    # 配置系统级文件描述符与网络优化
     echo -e "${YELLOW}--> 正在优化系统级文件描述符与网络参数...${RESET}"
     cat > /etc/security/limits.d/99-bbr-optimization.conf <<EOF
 * soft nofile 65535
@@ -324,7 +325,6 @@ EOF
 
         SS_LINK_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0 | tr -d '\n')
 
-        # 生成节点链接
         cat > "${SHOES_LINK_FILE}" <<EOF
 # Reality (IPv4)
 vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
@@ -361,7 +361,6 @@ update_certificate() {
         return
     fi
     
-    # 提取持久化的环境参数
     source "${SHOES_ENV_FILE}"
     
     [[ -f "${SHOES_CONF_DIR}/key.pem" ]] && mv "${SHOES_CONF_DIR}/key.pem" "${SHOES_CONF_DIR}/key.pem.bak"
@@ -381,7 +380,6 @@ update_certificate() {
         [[ -z "$HOST_IP" ]] && HOST_IP="YOUR_IPV4_HERE"
         SS_LINK_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0 | tr -d '\n')
         
-        # 生成节点链接
         cat > "${SHOES_LINK_FILE}" <<EOF
 # Reality (IPv4)
 vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
@@ -405,7 +403,7 @@ update_core() {
     systemctl stop shoes
     download_shoes_smart "force"
     systemctl restart shoes
-    echo -e "${GREEN}核心更新完成并已重启服务！${RESET}"
+    echo -e "${GREEN}核心更新完成并已重启服务！当前版本: $(get_local_version)${RESET}"
 }
 
 uninstall_shoes() {
@@ -415,8 +413,9 @@ uninstall_shoes() {
     rm -f "${SYSTEMD_FILE}"
     rm -rf "${SHOES_CONF_DIR}"
     rm -f "${SHOES_BIN}"
-    rm -f /etc/security/limits.d/99-shoes-fd.conf
-    rm -f /etc/sysctl.d/99-shoes-net.conf
+    # 修正清理实际生成的文件名
+    rm -f /etc/security/limits.d/99-bbr-optimization.conf
+    rm -f /etc/sysctl.d/99-bbr-optimization.conf
     systemctl daemon-reload
     echo -e "${GREEN}Shoes 及其相关配置已完全卸载。${RESET}"
 }
@@ -427,7 +426,8 @@ service_menu() {
         echo -e "${MAGENTA}=========================================================${RESET}"
         echo -e "${CYAN}                 Shoes 节点服务管理子菜单                ${RESET}"
         echo -e "${MAGENTA}=========================================================${RESET}"
-        echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
+        echo -e " ${BLUE}当前核心版本:${RESET} $(get_local_version)"
+        echo -e " ${BLUE}运行状态:${RESET}     $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
         echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
         echo "  1. 更新 Shoes 核心 (保留配置)"
         echo "  2. 卸载服务"
@@ -456,9 +456,10 @@ service_menu() {
 show_main_menu() {
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}         E-Shoes 代理节点一键管理脚本 3.3 Anytls              ${RESET}"
+    echo -e "${CYAN}         E-Shoes 代理节点一键管理脚本 (支持 v0.3.0)        ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
+    echo -e " ${BLUE}核心版本:${RESET} $(get_local_version)"
     echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
     echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
     echo -e "  1. 全新安装/重置服务 (${RED} 覆盖原有节点${RESET})"
