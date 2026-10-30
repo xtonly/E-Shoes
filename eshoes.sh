@@ -72,7 +72,6 @@ pick_vless_port() {
 }
 
 # ================== 智能防火墙探测与自动放行模块 ==================
-# 探测当前正在生效的防火墙类型：ufw | firewalld | nftables | iptables | none
 detect_firewall() {
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
         echo "ufw"
@@ -97,7 +96,6 @@ detect_firewall() {
     echo "none"
 }
 
-# 放行单个端口 (TCP + UDP)
 fw_open_port() {
     local port="$1"
     local fw_type="$2"
@@ -133,7 +131,6 @@ fw_open_port() {
     esac
 }
 
-# 移除旧端口放行规则 (TCP + UDP)
 fw_close_port() {
     local port="$1"
     local fw_type="$2"
@@ -176,7 +173,6 @@ fw_close_port() {
     esac
 }
 
-# 保存并重载防火墙配置
 fw_reload_save() {
     local fw_type="$1"
     case "$fw_type" in
@@ -193,7 +189,6 @@ fw_reload_save() {
     esac
 }
 
-# 统一同步防火墙端口（自动关闭被替换的旧端口，放行当前新端口）
 sync_firewall_ports() {
     local old_ss="$1"
     local old_vless="$2"
@@ -326,7 +321,7 @@ EOF
 EOF
 }
 
-# ================== 节点链接生成与分组置顶函数 ==================
+# ================== 节点链接生成函数 (VLESS 与 AnyTLS 仅保留 IPv4) ==================
 generate_links() {
     HOST_IP=$(get_public_ipv4)
     HOST_IPV6=$(get_public_ipv6)
@@ -338,11 +333,11 @@ generate_links() {
         echo -e "${GREEN}成功获取 IPv4: ${HOST_IP}${RESET}"
     fi
 
-    [[ -n "$HOST_IPV6" ]] && echo -e "${GREEN}成功获取 IPv6: ${HOST_IPV6}${RESET}"
+    [[ -n "$HOST_IPV6" ]] && echo -e "${GREEN}成功获取 IPv6: ${HOST_IPV6}${RESET} (仅用于 SS2022 置顶节点)"
 
     SS_LINK_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0 | tr -d '\n')
 
-    # 1. 置顶输出 Shadowsocks-2022 (IPv4 & IPv6)
+    # 1. 置顶输出 Shadowsocks-2022 (支持 IPv4 & IPv6)
     cat > "${SHOES_LINK_FILE}" <<EOF
 # ==================== [置顶] Shadowsocks-2022 ====================
 # SS2022 (IPv4)
@@ -356,7 +351,7 @@ ss://${SS_LINK_BASE}@[${HOST_IPV6}]:${SS_PORT}#${HOST_NAME}-SS2022-v6
 EOF
     fi
 
-    # 2. 其他协议分组：VLESS-Reality (固定 fp=chrome 并补全 spx=%2F 爬虫路径)
+    # 2. 其他协议分组：VLESS-Reality (仅保留 IPv4)
     cat >> "${SHOES_LINK_FILE}" <<EOF
 
 # ==================== [分组 1] VLESS-Reality ====================
@@ -364,27 +359,13 @@ EOF
 vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHID}&spx=%2F&type=tcp#${HOST_NAME}-Reality-v4
 EOF
 
-    if [[ -n "$HOST_IPV6" ]]; then
-        cat >> "${SHOES_LINK_FILE}" <<EOF
-# Reality (IPv6)
-vless://${UUID}@[${HOST_IPV6}]:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHID}&spx=%2F&type=tcp#${HOST_NAME}-Reality-v6
-EOF
-    fi
-
-    # 3. 其他协议分组：AnyTLS
+    # 3. 其他协议分组：AnyTLS (仅保留 IPv4)
     cat >> "${SHOES_LINK_FILE}" <<EOF
 
 # ==================== [分组 2] AnyTLS ====================
 # AnyTLS (IPv4)
 anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${ANYTLS_SNI}&allowInsecure=1&insecure=1&type=tcp#${HOST_NAME}-AnyTLS-v4
 EOF
-
-    if [[ -n "$HOST_IPV6" ]]; then
-        cat >> "${SHOES_LINK_FILE}" <<EOF
-# AnyTLS (IPv6)
-anytls://${PUBLIC_KEY}@[${HOST_IPV6}]:${ANYTLS_PORT}?security=tls&sni=${ANYTLS_SNI}&allowInsecure=1&insecure=1&type=tcp#${HOST_NAME}-AnyTLS-v6
-EOF
-    fi
 }
 
 # ================== 架构检测与下载 ==================
@@ -571,7 +552,7 @@ install_shoes() {
     echo -e "${YELLOW}--> 正在检测服务器网络栈环境并写入配置...${RESET}"
     write_shoes_configs
     if [[ "$BIND_ADDR" == "[::]" ]]; then
-        echo -e "${GREEN}检测到本地已开启 IPv6 协议栈，节点将配置为双栈监听 [::]${RESET}"
+        echo -e "${GREEN}检测到本地已开启 IPv6 协议栈，核心服务支持双栈监听 [::]${RESET}"
     else
         echo -e "${YELLOW}系统底层未开启 IPv6，将仅监听 IPv4 防止核心 Panic${RESET}"
     fi
@@ -627,13 +608,13 @@ EOF
     sleep 2
 
     if check_running; then
-        echo -e "${YELLOW}--> 正在生成节点订阅链接...${RESET}"
+        echo -e "${YELLOW}--> 正在生成节点订阅链接 (VLESS/AnyTLS 仅保留 IPv4)...${RESET}"
         generate_links
         
         echo -e "\n${GREEN}Shoes 部署完成！当前分配端口均在 20300 之后：${RESET}"
-        echo -e "  - ${CYAN}SS-2022 端口:${RESET} ${SS_PORT}"
-        echo -e "  - ${CYAN}VLESS 端口:${RESET}   ${VLESS_PORT}"
-        echo -e "  - ${CYAN}AnyTLS 端口:${RESET}  ${ANYTLS_PORT}"
+        echo -e "  - ${CYAN}SS-2022 端口:${RESET} ${SS_PORT} (含 IPv4 & IPv6)"
+        echo -e "  - ${CYAN}VLESS 端口:${RESET}   ${VLESS_PORT} (仅 IPv4)"
+        echo -e "  - ${CYAN}AnyTLS 端口:${RESET}  ${ANYTLS_PORT} (仅 IPv4)"
         
         echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
         cat "${SHOES_LINK_FILE}"
@@ -849,7 +830,6 @@ change_sni_menu() {
                 ;;
         esac
 
-        # 若修改了 Reality SNI，自动检测本机到目标域名 443 端口的 TLS 连通性
         if [[ -n "$new_sni" ]]; then
             echo -e "\n${YELLOW}--> 正在测试本机到 ${new_sni}:443 的 TLS 握手连通性...${RESET}"
             if timeout 5 openssl s_client -connect "${new_sni}:443" -servername "${new_sni}" </dev/null 2>/dev/null | grep -q "Verify return code: 0"; then
@@ -913,7 +893,6 @@ change_hostname_menu() {
     echo ""
     read -p "  请输入新的节点名称前缀 (如 HK-BGP 或 🇭🇰香港): " new_name
 
-    # 去除首尾空格及可能破坏 URI 的 # ? & 符号
     new_name=$(echo "$new_name" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr -d '#?&"')
 
     if [[ -z "$new_name" ]]; then
@@ -928,7 +907,6 @@ change_hostname_menu() {
         echo -e "\n${GREEN}--> 节点名称前缀已更新为: ${HOST_NAME}${RESET}"
     fi
 
-    # 仅需更新环境变量与链接文件，无需重启核心服务
     write_shoes_configs
     generate_links
 
@@ -1052,7 +1030,7 @@ show_main_menu() {
     local fw_status
     fw_status=$(detect_firewall)
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 4.1             ${RESET}"
+    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 4.2             ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}核心版本:${RESET} $(get_local_version)"
@@ -1103,8 +1081,6 @@ while true; do
             exit 0 
             ;;
         *) 
-            echo -e "${RED}无效选项，请重新输入！${RESET}"
-            sleep 1 
-            ;;
+            echo -e "${RED}无效选项，请重新输入！${RESET}"; sleep 1 ;;
     esac
 done
