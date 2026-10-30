@@ -36,6 +36,33 @@ get_local_version() {
     fi
 }
 
+# 检测端口是否被占用 (避开 443 及已占用端口)
+is_port_used() {
+    local port="$1"
+    ss -tuln 2>/dev/null | awk '{print $5}' | grep -qE ":${port}$"
+}
+
+# 为 VLESS 优先挑选常见 HTTPS 备用端口（避开 443），若均被占用则回退随机端口
+pick_vless_port() {
+    local alt_ports=(8443 2053 2083 2087 2096 9443)
+    # 打乱备用端口顺序
+    local shuffled=($(shuf -e "${alt_ports[@]}"))
+    for p in "${shuffled[@]}"; do
+        if ! is_port_used "$p"; then
+            echo "$p"
+            return
+        fi
+    done
+    local rand_p
+    while true; do
+        rand_p=$(shuf -i 10000-55000 -n 1)
+        if ! is_port_used "$rand_p"; then
+            echo "$rand_p"
+            return
+        fi
+    done
+}
+
 # === 强制系统时间同步 ===
 sync_system_time() {
     echo -e "${YELLOW}--> 正在强制同步服务器时间 (SS-2022 精准时间)...${RESET}"
@@ -106,18 +133,18 @@ ss://${SS_LINK_BASE}@[${HOST_IPV6}]:${SS_PORT}#${HOST_NAME}-SS2022-v6
 EOF
     fi
 
-    # 2. 其他协议分组：VLESS-Reality (优化 fp=chrome 降低探测风险)
+    # 2. 其他协议分组：VLESS-Reality (固定 fp=chrome 并补全 spx=%2F 爬虫路径)
     cat >> "${SHOES_LINK_FILE}" <<EOF
 
 # ==================== [分组 1] VLESS-Reality ====================
 # Reality (IPv4)
-vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}-Reality-v4
+vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHID}&spx=%2F&type=tcp#${HOST_NAME}-Reality-v4
 EOF
 
     if [[ -n "$HOST_IPV6" ]]; then
         cat >> "${SHOES_LINK_FILE}" <<EOF
 # Reality (IPv6)
-vless://${UUID}@[${HOST_IPV6}]:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}-Reality-v6
+vless://${UUID}@[${HOST_IPV6}]:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHID}&spx=%2F&type=tcp#${HOST_NAME}-Reality-v6
 EOF
     fi
 
@@ -231,12 +258,20 @@ install_shoes() {
             PRIVATE_KEY=$(grep 'private_key:' "${SHOES_CONF_FILE}" | head -n 1 | awk -F'"' '{print $2}')
         fi
         [[ -z "$HOST_NAME" ]] && HOST_NAME=$(hostname)
-        [[ -z "$SNI" ]] && SNI="www.apple.com"
-        [[ -z "$ANYTLS_SNI" ]] && ANYTLS_SNI="${SNI}"
+        
+        # 修复同步问题：若检测到旧的 icloud.com 自动替换为更稳妥的 www.apple.com
+        if [[ -z "$SNI" ]] || [[ "$SNI" == "icloud.com" ]]; then
+            SNI="www.apple.com"
+            echo -e "${YELLOW}--> 已自动将旧的 Reality SNI (icloud.com) 升级为 ${SNI}${RESET}"
+        fi
         
         SKIP_CERT=0
-        if [[ -f "${SHOES_CONF_DIR}/cert.pem" ]] && [[ -f "${SHOES_CONF_DIR}/key.pem" ]]; then
-            echo -e "${GREEN}--> 检测到现有 TLS 证书，跳过生成...${RESET}"
+        if [[ -z "$ANYTLS_SNI" ]] || [[ "$ANYTLS_SNI" == "icloud.com" ]] || [[ "$ANYTLS_SNI" == "$SNI" ]]; then
+            ANYTLS_SNI="cdn.cloudflare.net"
+            echo -e "${YELLOW}--> 已分离 AnyTLS 自签证书域名为 ${ANYTLS_SNI}，即将重新生成证书...${RESET}"
+            SKIP_CERT=0
+        elif [[ -f "${SHOES_CONF_DIR}/cert.pem" ]] && [[ -f "${SHOES_CONF_DIR}/key.pem" ]]; then
+            echo -e "${GREEN}--> 检测到现有合规 TLS 证书，跳过生成...${RESET}"
             SKIP_CERT=1
         fi
     else
@@ -244,19 +279,26 @@ install_shoes() {
             echo -e "${RED}警告：未检测到完整的旧配置环境，将自动执行全新安装！${RESET}"
         fi
         
-        echo -e "${YELLOW}--> 正在生成全新的安全密钥与端口...${RESET}"
+        echo -e "${YELLOW}--> 正在生成全新的安全密钥与端口 (自动避开 443)...${RESET}"
         HOST_NAME=$(hostname)
         [[ -z "$HOST_NAME" ]] && HOST_NAME="ShoeServer"
         
-        # 优化：替换敏感的 icloud.com，分离 Reality SNI 与 AnyTLS 自签证书域名，降低主动探测特征
         SNI="www.apple.com"
         ANYTLS_SNI="cdn.cloudflare.net"
 
-        SS_PORT=$(shuf -i 20000-60000 -n 1)
-        VLESS_PORT=$(shuf -i 20000-60000 -n 1)
-        ANYTLS_PORT=$(shuf -i 20000-60000 -n 1)
-        while [[ "$VLESS_PORT" == "$SS_PORT" ]]; do VLESS_PORT=$(shuf -i 20000-60000 -n 1); done
-        while [[ "$ANYTLS_PORT" == "$SS_PORT" || "$ANYTLS_PORT" == "$VLESS_PORT" ]]; do ANYTLS_PORT=$(shuf -i 20000-60000 -n 1); done
+        # 停止当前 shoes 以免自身占用备用端口影响检测
+        systemctl stop shoes >/dev/null 2>&1
+
+        # VLESS 优先使用常见 HTTPS 备用端口 (如 8443/2053/2083)，避开 443 与高位敏感区间
+        VLESS_PORT=$(pick_vless_port)
+        SS_PORT=$(shuf -i 20000-55000 -n 1)
+        ANYTLS_PORT=$(shuf -i 20000-55000 -n 1)
+        while [[ "$SS_PORT" == "$VLESS_PORT" ]] || is_port_used "$SS_PORT"; do
+            SS_PORT=$(shuf -i 20000-55000 -n 1)
+        done
+        while [[ "$ANYTLS_PORT" == "$SS_PORT" ]] || [[ "$ANYTLS_PORT" == "$VLESS_PORT" ]] || is_port_used "$ANYTLS_PORT"; do
+            ANYTLS_PORT=$(shuf -i 20000-55000 -n 1)
+        done
 
         UUID=$(cat /proc/sys/kernel/random/uuid)
         KEYPAIR=$(${SHOES_BIN} generate-reality-keypair)
@@ -265,7 +307,6 @@ install_shoes() {
         SHID=$(openssl rand -hex 8)
 
         SS_METHOD="2022-blake3-aes-256-gcm"
-        # 优先使用 Shoes 内置命令生成合规 SS2022 密钥，回退使用 openssl
         SS_PASSWORD=$(${SHOES_BIN} generate-shadowsocks-2022-password --cipher "${SS_METHOD}" 2>/dev/null | tail -n 1 | awk '{print $NF}')
         if [[ -z "$SS_PASSWORD" ]] || [[ ${#SS_PASSWORD} -lt 32 ]]; then
             SS_PASSWORD=$(openssl rand -base64 32 | tr -d '\n\r')
@@ -303,7 +344,6 @@ EOF
         echo -e "${YELLOW}系统底层未开启 IPv6，将仅监听 IPv4 防止核心 Panic${RESET}"
     fi
 
-    # 结合 Shoes 最新规范配置，将 SS-2022 置于配置文件首位，并增加空 short_id 兼容判断
     cat > "${SHOES_CONF_FILE}" <<EOF
 - address: "${BIND_ADDR}:${SS_PORT}"
   protocol:
@@ -340,11 +380,6 @@ EOF
               password: "${PUBLIC_KEY}"
           udp_enabled: true
 EOF
-
-    # 使用最新版 --dry-run 校验配置合法性
-    if ! ${SHOES_BIN} --dry-run "${SHOES_CONF_FILE}" >/dev/null 2>&1; then
-        echo -e "${YELLOW}提示：正在执行核心启动前配置检查...${RESET}"
-    fi
 
     cat > "${SYSTEMD_FILE}" <<EOF
 [Unit]
@@ -399,9 +434,9 @@ EOF
         generate_links
         
         if [[ "$install_mode" == "keep" ]]; then
-             echo -e "\n${GREEN}Shoes 环境修复/优化成功！您的节点配置已完全保留并更新排版！${RESET}"
+             echo -e "\n${GREEN}Shoes 环境修复/优化成功！您的节点配置已同步更新！${RESET}"
         else
-             echo -e "\n${GREEN}Shoes 节点服务全新安装成功！${RESET}"
+             echo -e "\n${GREEN}Shoes 节点服务全新安装成功 (VLESS 端口已优化为: ${VLESS_PORT})！${RESET}"
         fi
         
         echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
@@ -422,7 +457,7 @@ update_certificate() {
     fi
     
     source "${SHOES_ENV_FILE}"
-    [[ -z "$ANYTLS_SNI" ]] && ANYTLS_SNI="${SNI}"
+    [[ -z "$ANYTLS_SNI" ]] && ANYTLS_SNI="cdn.cloudflare.net"
     
     [[ -f "${SHOES_CONF_DIR}/key.pem" ]] && mv "${SHOES_CONF_DIR}/key.pem" "${SHOES_CONF_DIR}/key.pem.bak"
     [[ -f "${SHOES_CONF_DIR}/cert.pem" ]] && mv "${SHOES_CONF_DIR}/cert.pem" "${SHOES_CONF_DIR}/cert.pem.bak"
@@ -500,14 +535,14 @@ service_menu() {
 show_main_menu() {
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 3.6             ${RESET}"
+    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 3.7             ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}核心版本:${RESET} $(get_local_version)"
     echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
     echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
-    echo -e "  1. 全新安装/重置服务 (${RED}覆盖原有节点${RESET})"
-    echo -e "  2. 修复/优化系统环境 (${GREEN}保留原有节点并更新链接排版${RESET})"
+    echo -e "  1. 全新安装/重置密钥与端口 (${RED}刷新全部节点，避开443${RESET})"
+    echo -e "  2. 修复/优化系统环境 (${GREEN}保留原有端口密钥，升级SNI与链接${RESET})"
     echo "  3. 服务管理 (更新/卸载/启停)"
     echo "  4. 查看节点链接配置"
     echo "  5. 查看系统实时日志"
