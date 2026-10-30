@@ -341,13 +341,13 @@ generate_links() {
     cat > "${SHOES_LINK_FILE}" <<EOF
 # ==================== [置顶] Shadowsocks-2022 ====================
 # SS2022 (IPv4)
-ss://${SS_LINK_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS-v4
+ss://${SS_LINK_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS
 EOF
 
     if [[ -n "$HOST_IPV6" ]]; then
         cat >> "${SHOES_LINK_FILE}" <<EOF
 # SS2022 (IPv6)
-ss://${SS_LINK_BASE}@[${HOST_IPV6}]:${SS_PORT}#${HOST_NAME}-SS-v6
+ss://${SS_LINK_BASE}@[${HOST_IPV6}]:${SS_PORT}#${HOST_NAME}-SS-V6
 EOF
     fi
 
@@ -887,7 +887,7 @@ change_hostname_menu() {
     echo -e "${CYAN}               修改节点名称前缀 (HOST_NAME)              ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e "  ${BLUE}当前节点名称前缀:${RESET} ${GREEN}${HOST_NAME}${RESET}"
-    echo -e "  ${BLUE}生成后的节点示例:${RESET} ${YELLOW}${HOST_NAME}-SS-v4 / ${HOST_NAME}-Reality${RESET}"
+    echo -e "  ${BLUE}生成后的节点示例:${RESET} ${YELLOW}${HOST_NAME}-SS / ${HOST_NAME}-SS-V6 / ${HOST_NAME}-Reality${RESET}"
     echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
     echo -e "  提示：输入 ${CYAN}0${RESET} 可恢复为系统默认主机名 ($(hostname))，直接回车取消修改。"
     echo ""
