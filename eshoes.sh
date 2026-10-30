@@ -89,7 +89,6 @@ detect_firewall() {
         fi
     fi
     if command -v iptables >/dev/null 2>&1; then
-        # 检查 INPUT 链默认策略是否为 DROP/REJECT，或是否存在显式拦截规则
         if iptables -S INPUT 2>/dev/null | grep -qE "^-P INPUT (DROP|REJECT)|-j (DROP|REJECT)"; then
             echo "iptables"
             return
@@ -211,7 +210,6 @@ sync_firewall_ports() {
 
     echo -e "${CYAN}--> 检测到活动防火墙: [${fw_type}]，正在同步节点端口放行规则...${RESET}"
 
-    # 若存在旧端口且与新端口不同，先清理旧端口规则
     for old_p in "$old_ss" "$old_vless" "$old_anytls"; do
         if [[ -n "$old_p" ]] && [[ "$old_p" != "$SS_PORT" ]] && [[ "$old_p" != "$VLESS_PORT" ]] && [[ "$old_p" != "$ANYTLS_PORT" ]]; then
             fw_close_port "$old_p" "$fw_type"
@@ -219,7 +217,6 @@ sync_firewall_ports() {
         fi
     done
 
-    # 放行当前三个协议端口
     for new_p in "$SS_PORT" "$VLESS_PORT" "$ANYTLS_PORT"; do
         fw_open_port "$new_p" "$fw_type"
     done
@@ -476,7 +473,6 @@ install_shoes() {
     download_shoes_smart "normal"
     mkdir -p "${SHOES_CONF_DIR}"
 
-    # 记录原有旧端口（若存在），以便重置或迁移端口时自动清理旧防火墙规则
     local OLD_SS_PORT=""
     local OLD_VLESS_PORT=""
     local OLD_ANYTLS_PORT=""
@@ -495,7 +491,6 @@ install_shoes() {
         fi
         [[ -z "$HOST_NAME" ]] && HOST_NAME=$(hostname)
         
-        # 自动检查旧端口是否有 <= 20300 的情况，若有则自动迁移至 20301+
         if [[ -z "$VLESS_PORT" ]] || [[ "$VLESS_PORT" -lt "$PORT_MIN" ]]; then
             VLESS_PORT=$(pick_vless_port)
             echo -e "${YELLOW}--> 检测到原 VLESS 端口 <= 20300，已自动迁移至: ${VLESS_PORT}${RESET}"
@@ -581,7 +576,6 @@ install_shoes() {
         echo -e "${YELLOW}系统底层未开启 IPv6，将仅监听 IPv4 防止核心 Panic${RESET}"
     fi
 
-    # 自动探测防火墙并放行端口（若存在被替换的旧端口则自动关闭旧规则）
     sync_firewall_ports "$OLD_SS_PORT" "$OLD_VLESS_PORT" "$OLD_ANYTLS_PORT"
 
     cat > "${SYSTEMD_FILE}" <<EOF
@@ -715,7 +709,6 @@ change_ports_menu() {
         echo -e "${MAGENTA}=========================================================${RESET}"
         read -p "  请选择要修改的选项 [0-4]: " p_choice
 
-        # 修改前记录当前旧端口，用于防火墙规则替换
         local old_ss="$SS_PORT"
         local old_vless="$VLESS_PORT"
         local old_anytls="$ANYTLS_PORT"
@@ -776,6 +769,173 @@ change_ports_menu() {
         fi
         echo "" && read -n 1 -s -r -p "按任意键继续..."
     done
+}
+
+# ================== 修改伪装域名 (SNI) 功能 ==================
+change_sni_menu() {
+    if [[ ! -f "${SHOES_ENV_FILE}" ]] || [[ ! -f "${SHOES_CONF_FILE}" ]]; then
+        echo -e "\n${RED}错误：未检测到已安装的配置文件，请先执行安装！${RESET}"
+        return
+    fi
+
+    source "${SHOES_ENV_FILE}"
+    [[ -z "$ANYTLS_SNI" ]] && ANYTLS_SNI="cdn.cloudflare.net"
+
+    while true; do
+        clear
+        echo -e "${MAGENTA}=========================================================${RESET}"
+        echo -e "${CYAN}               修改 Reality / AnyTLS 伪装域名            ${RESET}"
+        echo -e "${MAGENTA}=========================================================${RESET}"
+        echo -e "  ${BLUE}当前 VLESS-Reality SNI:${RESET} ${GREEN}${SNI}${RESET}"
+        echo -e "  ${BLUE}当前 AnyTLS 证书域名:${RESET}    ${GREEN}${ANYTLS_SNI}${RESET}"
+        echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
+        echo -e "  ${YELLOW}推荐 Reality 预设域名 (TLS 1.3 + H2 高信誉目标):${RESET}"
+        echo "  1. www.apple.com           (Apple 全球静态节点，通用稳定)"
+        echo "  2. dl.google.com           (Google 下载源，欧美/亚太推荐)"
+        echo "  3. www.microsoft.com       (Microsoft 官网，全球双栈优选)"
+        echo "  4. www.amd.com             (AMD 官网，高频 CDN 节点)"
+        echo "  5. aws.amazon.com          (AWS 官网，AWS/欧美机房优选)"
+        echo "  6. www.lovelive-anime.jp   (日本二次元站点，日本机房优选)"
+        echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
+        echo -e "  7. ${CYAN}手动输入自定义 Reality 伪装域名 (SNI)${RESET}"
+        echo -e "  8. ${CYAN}修改 AnyTLS 自签证书域名 (并自动重签证书)${RESET}"
+        echo "  0. 返回上级菜单"
+        echo -e "${MAGENTA}=========================================================${RESET}"
+        read -p "  请选择操作选项 [0-8]: " sni_choice
+
+        local new_sni=""
+        local need_re_cert=0
+
+        case "$sni_choice" in
+            1) new_sni="www.apple.com" ;;
+            2) new_sni="dl.google.com" ;;
+            3) new_sni="www.microsoft.com" ;;
+            4) new_sni="www.amd.com" ;;
+            5) new_sni="aws.amazon.com" ;;
+            6) new_sni="www.lovelive-anime.jp" ;;
+            7)
+                read -p "  请输入自定义 Reality SNI 域名 (如 www.sony.jp): " custom_sni
+                custom_sni=$(echo "$custom_sni" | tr -d '[:space:]' | sed -E 's#^https?://##; s#/.*$##')
+                if [[ -z "$custom_sni" ]] || ! [[ "$custom_sni" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+                    echo -e "  ${RED}错误：域名格式无效，请重新输入！${RESET}"
+                    sleep 1.5
+                    continue
+                fi
+                new_sni="$custom_sni"
+                ;;
+            8)
+                read -p "  请输入新的 AnyTLS 自签证书域名 [当前: ${ANYTLS_SNI}]: " custom_anytls
+                custom_anytls=$(echo "$custom_anytls" | tr -d '[:space:]' | sed -E 's#^https?://##; s#/.*$##')
+                if [[ -z "$custom_anytls" ]] || ! [[ "$custom_anytls" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+                    echo -e "  ${RED}错误：域名格式无效，请重新输入！${RESET}"
+                    sleep 1.5
+                    continue
+                fi
+                if [[ "$custom_anytls" == "$SNI" ]]; then
+                    echo -e "  ${RED}错误：AnyTLS 证书域名不能与 Reality SNI (${SNI}) 相同，以免暴露自签特征！${RESET}"
+                    sleep 2
+                    continue
+                fi
+                ANYTLS_SNI="$custom_anytls"
+                need_re_cert=1
+                ;;
+            0)
+                return
+                ;;
+            *)
+                echo -e "${RED}无效选项，请重新输入！${RESET}"
+                sleep 1
+                continue
+                ;;
+        esac
+
+        # 若修改了 Reality SNI，自动检测本机到目标域名 443 端口的 TLS 连通性
+        if [[ -n "$new_sni" ]]; then
+            echo -e "\n${YELLOW}--> 正在测试本机到 ${new_sni}:443 的 TLS 握手连通性...${RESET}"
+            if timeout 5 openssl s_client -connect "${new_sni}:443" -servername "${new_sni}" </dev/null 2>/dev/null | grep -q "Verify return code: 0"; then
+                echo -e "${GREEN}--> 域名 ${new_sni}:443 TLS 证书校验通过！${RESET}"
+            else
+                echo -e "${YELLOW}警告：本机连接 ${new_sni}:443 超时或证书校验异常。${RESET}"
+                read -p "  是否仍然强制使用该域名？[y/N]: " force_sni
+                [[ ! "$force_sni" =~ ^[yY]$ ]] && continue
+            fi
+            SNI="$new_sni"
+            if [[ "$ANYTLS_SNI" == "$SNI" ]]; then
+                ANYTLS_SNI="cdn.cloudflare.net"
+                need_re_cert=1
+            fi
+        fi
+
+        if [[ "$need_re_cert" -eq 1 ]]; then
+            echo -e "${YELLOW}--> 正在为 AnyTLS (${ANYTLS_SNI}) 重新生成自签 TLS 证书...${RESET}"
+            openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
+            openssl req -new -x509 -days 365 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${ANYTLS_SNI}" -addext "subjectAltName=DNS:${ANYTLS_SNI}" >/dev/null 2>&1
+        fi
+
+        echo -e "${YELLOW}--> 正在更新配置文件并重启 Shoes 服务...${RESET}"
+        write_shoes_configs
+        systemctl restart shoes
+        sleep 2
+
+        if check_running; then
+            generate_links
+            echo -e "${GREEN}伪装域名修改成功并已生效！${RESET}"
+            echo -e "  - ${CYAN}当前 Reality SNI:${RESET} ${SNI}"
+            echo -e "  - ${CYAN}当前 AnyTLS SNI:${RESET}  ${ANYTLS_SNI}"
+            echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
+            cat "${SHOES_LINK_FILE}"
+            echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
+        else
+            echo -e "${RED}服务重启失败，请检查配置或系统日志！${RESET}"
+        fi
+        echo "" && read -n 1 -s -r -p "按任意键继续..."
+    done
+}
+
+# ================== 修改节点名称前缀 (HOST_NAME) 功能 ==================
+change_hostname_menu() {
+    if [[ ! -f "${SHOES_ENV_FILE}" ]] || [[ ! -f "${SHOES_CONF_FILE}" ]]; then
+        echo -e "\n${RED}错误：未检测到已安装的配置文件，请先执行安装！${RESET}"
+        return
+    fi
+
+    source "${SHOES_ENV_FILE}"
+    [[ -z "$ANYTLS_SNI" ]] && ANYTLS_SNI="cdn.cloudflare.net"
+
+    clear
+    echo -e "${MAGENTA}=========================================================${RESET}"
+    echo -e "${CYAN}               修改节点名称前缀 (HOST_NAME)              ${RESET}"
+    echo -e "${MAGENTA}=========================================================${RESET}"
+    echo -e "  ${BLUE}当前节点名称前缀:${RESET} ${GREEN}${HOST_NAME}${RESET}"
+    echo -e "  ${BLUE}生成后的节点示例:${RESET} ${YELLOW}${HOST_NAME}-SS2022-v4 / ${HOST_NAME}-Reality-v4${RESET}"
+    echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
+    echo -e "  提示：输入 ${CYAN}0${RESET} 可恢复为系统默认主机名 ($(hostname))，直接回车取消修改。"
+    echo ""
+    read -p "  请输入新的节点名称前缀 (如 HK-BGP 或 🇭🇰香港): " new_name
+
+    # 去除首尾空格及可能破坏 URI 的 # ? & 符号
+    new_name=$(echo "$new_name" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr -d '#?&"')
+
+    if [[ -z "$new_name" ]]; then
+        echo -e "\n${YELLOW}未输入内容，已取消修改。${RESET}"
+        return
+    elif [[ "$new_name" == "0" ]]; then
+        HOST_NAME=$(hostname)
+        [[ -z "$HOST_NAME" ]] && HOST_NAME="ShoeServer"
+        echo -e "\n${GREEN}--> 已恢复为系统默认主机名: ${HOST_NAME}${RESET}"
+    else
+        HOST_NAME="$new_name"
+        echo -e "\n${GREEN}--> 节点名称前缀已更新为: ${HOST_NAME}${RESET}"
+    fi
+
+    # 仅需更新环境变量与链接文件，无需重启核心服务
+    write_shoes_configs
+    generate_links
+
+    echo -e "${GREEN}节点订阅链接已无缝刷新（无需重启服务）：${RESET}"
+    echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
+    cat "${SHOES_LINK_FILE}"
+    echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
 }
 
 # ================== 证书管理 ==================
@@ -844,11 +1004,18 @@ uninstall_shoes() {
 service_menu() {
     while true; do
         clear
+        local cur_sni="未配置"
+        local cur_host="未配置"
+        if [[ -f "${SHOES_ENV_FILE}" ]]; then
+            cur_sni=$(grep '^SNI=' "${SHOES_ENV_FILE}" | awk -F'"' '{print $2}')
+            cur_host=$(grep '^HOST_NAME=' "${SHOES_ENV_FILE}" | awk -F'"' '{print $2}')
+        fi
         echo -e "${MAGENTA}=========================================================${RESET}"
         echo -e "${CYAN}                 Shoes 节点服务管理子菜单                ${RESET}"
         echo -e "${MAGENTA}=========================================================${RESET}"
         echo -e " ${BLUE}当前核心版本:${RESET} $(get_local_version)"
         echo -e " ${BLUE}运行状态:${RESET}     $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
+        echo -e " ${BLUE}当前伪装SNI:${RESET}  ${YELLOW}${cur_sni}${RESET}  |  ${BLUE}节点前缀:${RESET} ${YELLOW}${cur_host}${RESET}"
         echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
         echo "  1. 更新 Shoes 核心 (保留配置)"
         echo "  2. 卸载服务"
@@ -857,6 +1024,8 @@ service_menu() {
         echo "  5. 重启服务"
         echo "  6. 更新 TLS 证书 (自签证书)"
         echo -e "  7. 修改协议端口 (${GREEN}支持单独/随机更换，自动同步防火墙${RESET})"
+        echo -e "  8. 修改伪装域名 (${CYAN}支持预设/自定义 Reality SNI 与 AnyTLS 域名${RESET})"
+        echo -e "  9. 修改节点名称前缀 (${CYAN}自定义 HOST_NAME 别名，无需重启服务${RESET})"
         echo "  0. 返回主菜单"
         echo -e "${MAGENTA}=========================================================${RESET}"
         read -p "  请输入对应的数字选项: " sub_choice
@@ -869,6 +1038,8 @@ service_menu() {
             5) systemctl restart shoes; echo -e "\n${GREEN}服务已重启${RESET}"; echo "" && read -n 1 -s -r -p "按任意键返回..." ;;
             6) update_certificate; echo "" && read -n 1 -s -r -p "按任意键返回..." ;;
             7) change_ports_menu ;;
+            8) change_sni_menu ;;
+            9) change_hostname_menu; echo "" && read -n 1 -s -r -p "按任意键返回..." ;;
             0) return ;;
             *) echo -e "${RED}无效选项，请重新输入！${RESET}"; sleep 1 ;;
         esac
@@ -881,7 +1052,7 @@ show_main_menu() {
     local fw_status
     fw_status=$(detect_firewall)
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 4.0             ${RESET}"
+    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 4.1             ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}核心版本:${RESET} $(get_local_version)"
@@ -890,7 +1061,7 @@ show_main_menu() {
     echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
     echo -e "  1. 全新安装/重置密钥与端口 (${RED}全自动分配 > 20300，自动放行防火墙${RESET})"
     echo -e "  2. 修复/优化系统环境 (${GREEN}保留原有节点，同步防火墙规则${RESET})"
-    echo -e "  3. 服务管理 (${CYAN}更新/卸载/启停/修改协议端口${RESET})"
+    echo -e "  3. 服务管理 (${CYAN}更新/卸载/修改端口/自定义SNI/修改节点名称${RESET})"
     echo "  4. 查看节点链接配置"
     echo "  5. 查看系统实时日志"
     echo "  0. 退出脚本"
