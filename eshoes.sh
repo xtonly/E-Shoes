@@ -341,13 +341,13 @@ generate_links() {
     cat > "${SHOES_LINK_FILE}" <<EOF
 # ==================== [置顶] Shadowsocks-2022 ====================
 # SS2022 (IPv4)
-ss://${SS_LINK_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS2022-v4
+ss://${SS_LINK_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS-v4
 EOF
 
     if [[ -n "$HOST_IPV6" ]]; then
         cat >> "${SHOES_LINK_FILE}" <<EOF
 # SS2022 (IPv6)
-ss://${SS_LINK_BASE}@[${HOST_IPV6}]:${SS_PORT}#${HOST_NAME}-SS2022-v6
+ss://${SS_LINK_BASE}@[${HOST_IPV6}]:${SS_PORT}#${HOST_NAME}-SS-v6
 EOF
     fi
 
@@ -356,7 +356,7 @@ EOF
 
 # ==================== [分组 1] VLESS-Reality ====================
 # Reality (IPv4)
-vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHID}&spx=%2F&type=tcp#${HOST_NAME}-Reality-v4
+vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHID}&spx=%2F&type=tcp#${HOST_NAME}-Reality
 EOF
 
     # 3. 其他协议分组：AnyTLS (仅保留 IPv4)
@@ -364,7 +364,7 @@ EOF
 
 # ==================== [分组 2] AnyTLS ====================
 # AnyTLS (IPv4)
-anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${ANYTLS_SNI}&allowInsecure=1&insecure=1&type=tcp#${HOST_NAME}-AnyTLS-v4
+anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${ANYTLS_SNI}&allowInsecure=1&insecure=1&type=tcp#${HOST_NAME}-AnyTLS
 EOF
 }
 
@@ -887,7 +887,7 @@ change_hostname_menu() {
     echo -e "${CYAN}               修改节点名称前缀 (HOST_NAME)              ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e "  ${BLUE}当前节点名称前缀:${RESET} ${GREEN}${HOST_NAME}${RESET}"
-    echo -e "  ${BLUE}生成后的节点示例:${RESET} ${YELLOW}${HOST_NAME}-SS2022-v4 / ${HOST_NAME}-Reality-v4${RESET}"
+    echo -e "  ${BLUE}生成后的节点示例:${RESET} ${YELLOW}${HOST_NAME}-SS-v4 / ${HOST_NAME}-Reality${RESET}"
     echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
     echo -e "  提示：输入 ${CYAN}0${RESET} 可恢复为系统默认主机名 ($(hostname))，直接回车取消修改。"
     echo ""
