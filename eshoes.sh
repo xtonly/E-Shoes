@@ -1,4 +1,5 @@
 #!/bin/bash
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 # ================== 颜色代码与风格统一 ==================
 RED='\033[1;31m'
@@ -71,28 +72,61 @@ pick_vless_port() {
     pick_random_port
 }
 
-# ================== 智能防火墙探测与自动放行模块 ==================
+# ================== 增强型智能防火墙探测与自动放行模块 ==================
 detect_firewall() {
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        echo "ufw"
-        return
-    fi
-    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
-        echo "firewalld"
-        return
-    fi
-    if command -v nft >/dev/null 2>&1 && systemctl is-active --quiet nftables 2>/dev/null; then
-        if nft list tables 2>/dev/null | grep -q .; then
-            echo "nftables"
+    # 1. 检测 UFW (兼容中英文输出及配置文件直接读取)
+    if command -v ufw >/dev/null 2>&1; then
+        if LANG=C ufw status 2>/dev/null | grep -qiE "Status:\s*active" || \
+           ufw status 2>/dev/null | grep -qE "激活|active" || \
+           grep -qi "^ENABLED=yes" /etc/ufw/ufw.conf 2>/dev/null; then
+            echo "ufw"
             return
         fi
     fi
+
+    # 2. 检测 Firewalld (兼容 systemd 与 firewall-cmd 状态码)
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        if systemctl is-active --quiet firewalld 2>/dev/null || firewall-cmd --state >/dev/null 2>&1; then
+            echo "firewalld"
+            return
+        fi
+    fi
+
+    # 3. 检测 nftables (兼容未启用 systemd 服务但内核已加载 input 钩子规则的情况)
+    if command -v nft >/dev/null 2>&1; then
+        local nft_rules
+        nft_rules=$(nft list ruleset 2>/dev/null)
+        if [[ -n "$nft_rules" ]] && echo "$nft_rules" | grep -q "hook input"; then
+            # 若并非仅由 iptables-nft 自动生成的空表，或明确开启了 nftables 服务/含有 drop/reject 策略
+            if systemctl is-active --quiet nftables 2>/dev/null || \
+               echo "$nft_rules" | grep -qiE "policy drop|policy reject|drop|reject"; then
+                if ! command -v iptables >/dev/null 2>&1 || systemctl is-active --quiet nftables 2>/dev/null; then
+                    echo "nftables"
+                    return
+                fi
+            fi
+        fi
+    fi
+
+    # 4. 检测 iptables (扫描全部链中的 DROP/REJECT 规则，兼容甲骨文云/云镜像/宝塔等自定义链)
     if command -v iptables >/dev/null 2>&1; then
-        if iptables -S INPUT 2>/dev/null | grep -qE "^-P INPUT (DROP|REJECT)|-j (DROP|REJECT)"; then
+        if iptables -S 2>/dev/null | grep -qE "^-P INPUT (DROP|REJECT)|-j (DROP|REJECT)|-j InstanceServices" || \
+           systemctl is-active --quiet netfilter-persistent 2>/dev/null || \
+           systemctl is-active --quiet iptables 2>/dev/null || \
+           [[ -s /etc/iptables/rules.v4 ]] || [[ -s /etc/sysconfig/iptables ]]; then
             echo "iptables"
             return
         fi
     fi
+
+    # 5. 再次兜底检测 nftables (防止上面因为安装了 iptables 而跳过纯 nft 规则)
+    if command -v nft >/dev/null 2>&1; then
+        if nft list ruleset 2>/dev/null | grep -q "hook input"; then
+            echo "nftables"
+            return
+        fi
+    fi
+
     echo "none"
 }
 
@@ -112,19 +146,21 @@ fw_open_port() {
             ;;
         nftables)
             local nft_info
-            nft_info=$(nft list ruleset 2>/dev/null | awk '/table /{t=$2; f=$3} /hook input/{print t, f; exit}')
+            nft_info=$(nft list ruleset 2>/dev/null | awk '/^table /{f=$2; t=$3} /hook input/{print f, t; exit}')
             if [[ -n "$nft_info" ]]; then
                 local fam=$(echo "$nft_info" | awk '{print $1}')
                 local tab=$(echo "$nft_info" | awk '{print $2}')
-                nft insert rule "$fam" "$tab" input tcp dport "$port" counter accept comment \"Shoes-Proxy\" >/dev/null 2>&1
-                nft insert rule "$fam" "$tab" input udp dport "$port" counter accept comment \"Shoes-Proxy\" >/dev/null 2>&1
+                local chn=$(nft list table "$fam" "$tab" 2>/dev/null | awk '/chain /{c=$2} /hook input/{print c; exit}')
+                [[ -z "$chn" ]] && chn="input"
+                nft insert rule "$fam" "$tab" "$chn" tcp dport "$port" counter accept comment \"Shoes-Proxy\" >/dev/null 2>&1
+                nft insert rule "$fam" "$tab" "$chn" udp dport "$port" counter accept comment \"Shoes-Proxy\" >/dev/null 2>&1
             fi
             ;;
         iptables)
             for cmd in iptables ip6tables; do
                 if command -v "$cmd" >/dev/null 2>&1; then
-                    "$cmd" -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || "$cmd" -I INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1
-                    "$cmd" -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || "$cmd" -I INPUT -p udp --dport "$port" -j ACCEPT >/dev/null 2>&1
+                    "$cmd" -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || "$cmd" -I INPUT 1 -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1
+                    "$cmd" -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || "$cmd" -I INPUT 1 -p udp --dport "$port" -j ACCEPT >/dev/null 2>&1
                 fi
             done
             ;;
@@ -147,14 +183,16 @@ fw_close_port() {
             ;;
         nftables)
             local nft_info
-            nft_info=$(nft list ruleset 2>/dev/null | awk '/table /{t=$2; f=$3} /hook input/{print t, f; exit}')
+            nft_info=$(nft list ruleset 2>/dev/null | awk '/^table /{f=$2; t=$3} /hook input/{print f, t; exit}')
             if [[ -n "$nft_info" ]]; then
                 local fam=$(echo "$nft_info" | awk '{print $1}')
                 local tab=$(echo "$nft_info" | awk '{print $2}')
+                local chn=$(nft list table "$fam" "$tab" 2>/dev/null | awk '/chain /{c=$2} /hook input/{print c; exit}')
+                [[ -z "$chn" ]] && chn="input"
                 local handles
-                handles=$(nft -a list chain "$fam" "$tab" input 2>/dev/null | grep -E "dport ${port} .*Shoes-Proxy" | awk '{print $NF}')
+                handles=$(nft -a list chain "$fam" "$tab" "$chn" 2>/dev/null | grep -E "dport ${port} .*Shoes-Proxy" | awk '{print $NF}')
                 for h in $handles; do
-                    nft delete rule "$fam" "$tab" input handle "$h" >/dev/null 2>&1
+                    nft delete rule "$fam" "$tab" "$chn" handle "$h" >/dev/null 2>&1
                 done
             fi
             ;;
@@ -176,11 +214,20 @@ fw_close_port() {
 fw_reload_save() {
     local fw_type="$1"
     case "$fw_type" in
+        ufw)
+            ufw reload >/dev/null 2>&1
+            ;;
         firewalld)
             firewall-cmd --reload >/dev/null 2>&1
             ;;
+        nftables)
+            if [[ -w /etc/nftables.conf ]] && systemctl is-active --quiet nftables 2>/dev/null; then
+                nft list ruleset > /etc/nftables.conf 2>/dev/null
+            fi
+            ;;
         iptables)
             command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1
+            command -v service >/dev/null 2>&1 && service iptables save >/dev/null 2>&1
             if [[ -d /etc/iptables ]]; then
                 iptables-save > /etc/iptables/rules.v4 2>/dev/null
                 command -v ip6tables-save >/dev/null 2>&1 && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
@@ -199,7 +246,14 @@ sync_firewall_ports() {
     fw_type=$(detect_firewall)
 
     if [[ "$fw_type" == "none" ]]; then
-        echo -e "${GREEN}未检测到启用中的防火墙 (或默认策略为全放行)，保持系统现状。${RESET}"
+        echo -e "${GREEN}未检测到启用中的拦截型防火墙 (默认策略为全放行)。${RESET}"
+        # 即使未探测到拦截规则，若系统存在 iptables 命令，也主动在 INPUT 链插入放行规则作为双保险
+        if command -v iptables >/dev/null 2>&1; then
+            fw_open_port "$SS_PORT" "iptables"
+            fw_open_port "$VLESS_PORT" "iptables"
+            fw_open_port "$ANYTLS_PORT" "iptables"
+            echo -e "${CYAN}--> 已通过 iptables 写入底层端口放行规则 (${SS_PORT}, ${VLESS_PORT}, ${ANYTLS_PORT})${RESET}"
+        fi
         return
     fi
 
