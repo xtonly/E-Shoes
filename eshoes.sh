@@ -1059,7 +1059,7 @@ show_main_menu() {
     echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
     echo -e " ${BLUE}防火墙:${RESET}   $( [[ "$fw_status" == "none" ]] && echo -e "${GREEN}未启用/全放行${RESET}" || echo -e "${YELLOW}${fw_status} (运行中)${RESET}" )"
     echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
-    echo -e "  1. 全新安装/重置密钥与端口 (${RED}全自动分配 > 20300，自动放行防火墙${RESET})"
+    echo -e "  1. 全新安装/重置密钥与端口 (${RED}自动分配 > 20300，自动放行${RESET})"
     echo -e "  2. 修复/优化系统环境 (${GREEN}保留原有节点，同步防火墙规则${RESET})"
     echo -e "  3. 服务管理 (${CYAN}更新/卸载/修改端口/自定义SNI/修改节点名称${RESET})"
     echo "  4. 查看节点链接配置"
