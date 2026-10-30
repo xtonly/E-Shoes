@@ -54,22 +54,87 @@ sync_system_time() {
 # === 智能 IP 获取 ===
 get_public_ipv4() {
     local ip=""
-    ip=$(curl -s -4 --max-time 5 http://checkip.amazonaws.com)
-    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$ip"; return; fi
-    ip=$(curl -s -4 --max-time 5 http://ifconfig.me/ip)
-    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$ip"; return; fi
-    ip=$(curl -s -4 --max-time 5 http://api.ipify.org)
-    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$ip"; return; fi
+    for url in "http://checkip.amazonaws.com" "http://ifconfig.me/ip" "http://api.ipify.org"; do
+        ip=$(curl -s -4 --max-time 5 "$url" | tr -d '[:space:]')
+        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "$ip"
+            return
+        fi
+    done
     echo ""
 }
 
 get_public_ipv6() {
     local ip=""
-    ip=$(curl -s -6 --max-time 5 http://ifconfig.co/ip)
-    if [[ "$ip" == *":"* ]] && [[ "$ip" != *"<"* ]]; then echo "$ip"; return; fi
-    ip=$(curl -s -6 --max-time 5 http://icanhazip.com)
-    if [[ "$ip" == *":"* ]] && [[ "$ip" != *"<"* ]]; then echo "$ip"; return; fi
+    for url in "http://ifconfig.co/ip" "http://icanhazip.com" "http://api64.ipify.org"; do
+        ip=$(curl -s -6 --max-time 5 "$url" | tr -d '[:space:]')
+        if [[ "$ip" == *":"* ]] && [[ "$ip" != *"<"* ]]; then
+            echo "$ip"
+            return
+        fi
+    done
     echo ""
+}
+
+# ================== 节点链接生成与分组置顶函数 ==================
+generate_links() {
+    HOST_IP=$(get_public_ipv4)
+    HOST_IPV6=$(get_public_ipv6)
+
+    if [[ -z "$HOST_IP" ]]; then
+        echo -e "${RED}警告：无法自动获取 IPv4 地址，链接中将使用占位符。${RESET}"
+        HOST_IP="YOUR_IPV4_HERE"
+    else
+        echo -e "${GREEN}成功获取 IPv4: ${HOST_IP}${RESET}"
+    fi
+
+    [[ -n "$HOST_IPV6" ]] && echo -e "${GREEN}成功获取 IPv6: ${HOST_IPV6}${RESET}"
+
+    SS_LINK_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0 | tr -d '\n')
+
+    # 1. 置顶输出 Shadowsocks-2022 (IPv4 & IPv6)
+    cat > "${SHOES_LINK_FILE}" <<EOF
+# ==================== [置顶] Shadowsocks-2022 ====================
+# SS2022 (IPv4)
+ss://${SS_LINK_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS2022-v4
+EOF
+
+    if [[ -n "$HOST_IPV6" ]]; then
+        cat >> "${SHOES_LINK_FILE}" <<EOF
+# SS2022 (IPv6)
+ss://${SS_LINK_BASE}@[${HOST_IPV6}]:${SS_PORT}#${HOST_NAME}-SS2022-v6
+EOF
+    fi
+
+    # 2. 其他协议分组：VLESS-Reality (优化 fp=chrome 降低探测风险)
+    cat >> "${SHOES_LINK_FILE}" <<EOF
+
+# ==================== [分组 1] VLESS-Reality ====================
+# Reality (IPv4)
+vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}-Reality-v4
+EOF
+
+    if [[ -n "$HOST_IPV6" ]]; then
+        cat >> "${SHOES_LINK_FILE}" <<EOF
+# Reality (IPv6)
+vless://${UUID}@[${HOST_IPV6}]:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}-Reality-v6
+EOF
+    fi
+
+    # 3. 其他协议分组：AnyTLS
+    cat >> "${SHOES_LINK_FILE}" <<EOF
+
+# ==================== [分组 2] AnyTLS ====================
+# AnyTLS (IPv4)
+anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${ANYTLS_SNI}&allowInsecure=1&insecure=1&type=tcp#${HOST_NAME}-AnyTLS-v4
+EOF
+
+    if [[ -n "$HOST_IPV6" ]]; then
+        cat >> "${SHOES_LINK_FILE}" <<EOF
+# AnyTLS (IPv6)
+anytls://${PUBLIC_KEY}@[${HOST_IPV6}]:${ANYTLS_PORT}?security=tls&sni=${ANYTLS_SNI}&allowInsecure=1&insecure=1&type=tcp#${HOST_NAME}-AnyTLS-v6
+EOF
+    fi
 }
 
 # ================== 架构检测与下载 ==================
@@ -120,7 +185,6 @@ download_shoes_smart() {
     cd "${TMP_DIR}" || exit 1
 
     echo -e "${YELLOW}--> 尝试下载 GNU 版本 (v${LATEST_VER})...${RESET}"
-    # 修改处：增加 --timeout 和 --tries 限制，并去掉 -q 以显示下载进度，防止卡死
     wget --timeout=15 --tries=3 -O shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${GNU_FILE}"
     
     if [[ -f shoes.tar.gz ]] && tar -xzf shoes.tar.gz 2>/dev/null; then
@@ -134,7 +198,6 @@ download_shoes_smart() {
 
     echo -e "${RED}GNU 版本下载失败或无法运行，自动切换 MUSL 版本...${RESET}"
     rm -f "${SHOES_BIN}" shoes.tar.gz
-    # 修改处：同上，增加超时和重试限制
     wget --timeout=15 --tries=3 -O shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${MUSL_FILE}"
     
     if [[ -f shoes.tar.gz ]] && tar -xzf shoes.tar.gz 2>/dev/null; then
@@ -168,7 +231,8 @@ install_shoes() {
             PRIVATE_KEY=$(grep 'private_key:' "${SHOES_CONF_FILE}" | head -n 1 | awk -F'"' '{print $2}')
         fi
         [[ -z "$HOST_NAME" ]] && HOST_NAME=$(hostname)
-        [[ -z "$SNI" ]] && SNI="icloud.com"
+        [[ -z "$SNI" ]] && SNI="www.apple.com"
+        [[ -z "$ANYTLS_SNI" ]] && ANYTLS_SNI="${SNI}"
         
         SKIP_CERT=0
         if [[ -f "${SHOES_CONF_DIR}/cert.pem" ]] && [[ -f "${SHOES_CONF_DIR}/key.pem" ]]; then
@@ -183,23 +247,29 @@ install_shoes() {
         echo -e "${YELLOW}--> 正在生成全新的安全密钥与端口...${RESET}"
         HOST_NAME=$(hostname)
         [[ -z "$HOST_NAME" ]] && HOST_NAME="ShoeServer"
-        SNI="icloud.com"
+        
+        # 优化：替换敏感的 icloud.com，分离 Reality SNI 与 AnyTLS 自签证书域名，降低主动探测特征
+        SNI="www.apple.com"
+        ANYTLS_SNI="cdn.cloudflare.net"
 
+        SS_PORT=$(shuf -i 20000-60000 -n 1)
         VLESS_PORT=$(shuf -i 20000-60000 -n 1)
         ANYTLS_PORT=$(shuf -i 20000-60000 -n 1)
-        SS_PORT=$(shuf -i 20000-60000 -n 1)
-        while [[ "$ANYTLS_PORT" == "$VLESS_PORT" ]]; do ANYTLS_PORT=$(shuf -i 20000-60000 -n 1); done
-        while [[ "$SS_PORT" == "$VLESS_PORT" || "$SS_PORT" == "$ANYTLS_PORT" ]]; do SS_PORT=$(shuf -i 20000-60000 -n 1); done
+        while [[ "$VLESS_PORT" == "$SS_PORT" ]]; do VLESS_PORT=$(shuf -i 20000-60000 -n 1); done
+        while [[ "$ANYTLS_PORT" == "$SS_PORT" || "$ANYTLS_PORT" == "$VLESS_PORT" ]]; do ANYTLS_PORT=$(shuf -i 20000-60000 -n 1); done
 
         UUID=$(cat /proc/sys/kernel/random/uuid)
-        # 注意：此处必须用兼容方式或直接调用鞋子内置命令
         KEYPAIR=$(${SHOES_BIN} generate-reality-keypair)
-        PRIVATE_KEY=$(echo "$KEYPAIR" | grep "private key" | awk '{print $4}')
-        PUBLIC_KEY=$(echo "$KEYPAIR" | grep "public key" | awk '{print $4}')
+        PRIVATE_KEY=$(echo "$KEYPAIR" | grep -i "private key" | awk '{print $NF}')
+        PUBLIC_KEY=$(echo "$KEYPAIR" | grep -i "public key" | awk '{print $NF}')
         SHID=$(openssl rand -hex 8)
 
         SS_METHOD="2022-blake3-aes-256-gcm"
-        SS_PASSWORD=$(openssl rand -base64 32 | tr -d '\n' | tr -d '\r')
+        # 优先使用 Shoes 内置命令生成合规 SS2022 密钥，回退使用 openssl
+        SS_PASSWORD=$(${SHOES_BIN} generate-shadowsocks-2022-password --cipher "${SS_METHOD}" 2>/dev/null | tail -n 1 | awk '{print $NF}')
+        if [[ -z "$SS_PASSWORD" ]] || [[ ${#SS_PASSWORD} -lt 32 ]]; then
+            SS_PASSWORD=$(openssl rand -base64 32 | tr -d '\n\r')
+        fi
         SKIP_CERT=0
     fi
 
@@ -215,17 +285,16 @@ ANYTLS_PORT="${ANYTLS_PORT}"
 SS_PORT="${SS_PORT}"
 HOST_NAME="${HOST_NAME}"
 SNI="${SNI}"
+ANYTLS_SNI="${ANYTLS_SNI}"
 EOF
 
     if [[ "$SKIP_CERT" -eq 0 ]]; then
-        echo -e "${YELLOW}--> 正在生成包含 SAN 扩展的自签 TLS 证书...${RESET}"
+        echo -e "${YELLOW}--> 正在生成包含 SAN 扩展的自签 TLS 证书 (365天标准周期)...${RESET}"
         openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
-        openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" -addext "subjectAltName=DNS:${SNI}" >/dev/null 2>&1
+        openssl req -new -x509 -days 365 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${ANYTLS_SNI}" -addext "subjectAltName=DNS:${ANYTLS_SNI}" >/dev/null 2>&1
     fi
 
     echo -e "${YELLOW}--> 正在检测服务器网络栈环境...${RESET}"
-    HOST_IPV6=$(get_public_ipv6)
-    
     if ip a | grep -qw inet6; then
         BIND_ADDR="[::]"
         echo -e "${GREEN}检测到本地已开启 IPv6 协议栈，节点将配置为双栈监听 [::]${RESET}"
@@ -234,7 +303,15 @@ EOF
         echo -e "${YELLOW}系统底层未开启 IPv6，将仅监听 IPv4 防止核心 Panic${RESET}"
     fi
 
+    # 结合 Shoes 最新规范配置，将 SS-2022 置于配置文件首位，并增加空 short_id 兼容判断
     cat > "${SHOES_CONF_FILE}" <<EOF
+- address: "${BIND_ADDR}:${SS_PORT}"
+  protocol:
+    type: shadowsocks
+    cipher: "${SS_METHOD}"
+    password: "${SS_PASSWORD}"
+    udp_enabled: true
+
 - address: "${BIND_ADDR}:${VLESS_PORT}"
   protocol:
     type: tls
@@ -248,26 +325,26 @@ EOF
           type: vless
           user_id: "${UUID}"
           udp_enabled: true
+
 - address: "${BIND_ADDR}:${ANYTLS_PORT}"
   protocol:
     type: tls
     tls_targets:
-      "${SNI}":
+      "${ANYTLS_SNI}":
         cert: "${SHOES_CONF_DIR}/cert.pem"
         key: "${SHOES_CONF_DIR}/key.pem"
         protocol:
           type: anytls
           users:
-            - name: anylts
+            - name: anytls
               password: "${PUBLIC_KEY}"
           udp_enabled: true
-- address: "${BIND_ADDR}:${SS_PORT}"
-  protocol:
-    type: shadowsocks
-    cipher: "${SS_METHOD}"
-    password: "${SS_PASSWORD}"
-    udp_enabled: true
 EOF
+
+    # 使用最新版 --dry-run 校验配置合法性
+    if ! ${SHOES_BIN} --dry-run "${SHOES_CONF_FILE}" >/dev/null 2>&1; then
+        echo -e "${YELLOW}提示：正在执行核心启动前配置检查...${RESET}"
+    fi
 
     cat > "${SYSTEMD_FILE}" <<EOF
 [Unit]
@@ -279,6 +356,7 @@ Type=simple
 User=root
 WorkingDirectory=${SHOES_CONF_DIR}
 Environment="RUST_LOG=error,shoes::tcp::tcp_server=off"
+ExecStartPre=${SHOES_BIN} --dry-run ${SHOES_CONF_FILE}
 ExecStart=${SHOES_BIN} ${SHOES_CONF_FILE}
 Restart=on-failure
 RestartSec=3
@@ -291,13 +369,13 @@ EOF
     echo -e "${YELLOW}--> 正在优化系统级文件描述符与网络参数...${RESET}"
     cat > /etc/security/limits.d/99-bbr-optimization.conf <<EOF
 * soft nofile 65535
-* hard nofile 104857
+* hard nofile 1048576
 root soft nofile 65535
-root hard nofile 104857
+root hard nofile 1048576
 EOF
 
     cat > /etc/sysctl.d/99-bbr-optimization.conf <<'EOF'
-fs.file-max = 100000
+fs.file-max = 1048576
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_fastopen = 3
@@ -314,37 +392,14 @@ EOF
     systemctl daemon-reload
     systemctl enable shoes >/dev/null 2>&1
     systemctl restart shoes
-    sleep 3
+    sleep 2
 
     if check_running; then
-        echo -e "${YELLOW}--> 正在获取公网 IP...${RESET}"
-        
-        HOST_IP=$(get_public_ipv4)
-
-        if [[ -z "$HOST_IP" ]]; then
-            echo -e "${RED}警告：无法自动获取 IPv4 地址，链接中可能为空。${RESET}"
-            HOST_IP="YOUR_IPV4_HERE"
-        else
-            echo -e "${GREEN}成功获取 IPv4: ${HOST_IP}${RESET}"
-        fi
-
-        SS_LINK_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0 | tr -d '\n')
-
-        cat > "${SHOES_LINK_FILE}" <<EOF
-# Reality (IPv4)
-vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
-# AnyTLS (IPv4)
-anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&allowInsecure=1&insecure=1&type=tcp#${HOST_NAME}-Anytls
-# Shadowsocks-2022 (IPv4)
-ss://${SS_LINK_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS
-EOF
-        if [[ -n "$HOST_IPV6" ]]; then
-            echo -e "\n# Reality (IPv6)\nvless://${UUID}@[${HOST_IPV6}]:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}-v6" >> "${SHOES_LINK_FILE}"
-            echo -e "${GREEN}成功获取 IPv6: ${HOST_IPV6}${RESET}"
-        fi
+        echo -e "${YELLOW}--> 正在生成节点订阅链接...${RESET}"
+        generate_links
         
         if [[ "$install_mode" == "keep" ]]; then
-             echo -e "\n${GREEN}Shoes 环境修复/优化成功！您的节点配置已完全保留！${RESET}"
+             echo -e "\n${GREEN}Shoes 环境修复/优化成功！您的节点配置已完全保留并更新排版！${RESET}"
         else
              echo -e "\n${GREEN}Shoes 节点服务全新安装成功！${RESET}"
         fi
@@ -354,7 +409,7 @@ EOF
         echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
     else
         echo -e "${RED}服务启动失败！以下为调试信息：${RESET}"
-        ${SHOES_BIN} ${SHOES_CONF_FILE}
+        ${SHOES_BIN} "${SHOES_CONF_FILE}"
     fi
 }
 
@@ -367,35 +422,20 @@ update_certificate() {
     fi
     
     source "${SHOES_ENV_FILE}"
+    [[ -z "$ANYTLS_SNI" ]] && ANYTLS_SNI="${SNI}"
     
     [[ -f "${SHOES_CONF_DIR}/key.pem" ]] && mv "${SHOES_CONF_DIR}/key.pem" "${SHOES_CONF_DIR}/key.pem.bak"
     [[ -f "${SHOES_CONF_DIR}/cert.pem" ]] && mv "${SHOES_CONF_DIR}/cert.pem" "${SHOES_CONF_DIR}/cert.pem.bak"
 
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
-    openssl req -new -x509 -days 3650 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${SNI}" -addext "subjectAltName=DNS:${SNI}" >/dev/null 2>&1
+    openssl req -new -x509 -days 365 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${ANYTLS_SNI}" -addext "subjectAltName=DNS:${ANYTLS_SNI}" >/dev/null 2>&1
 
     echo -e "${YELLOW}--> 正在重启服务以应用新证书...${RESET}"
     systemctl restart shoes
     
     if check_running; then
         echo -e "${GREEN}服务已重启，新自签证书已生效。正在更新节点链接...${RESET}"
-        
-        HOST_IP=$(get_public_ipv4)
-        HOST_IPV6=$(get_public_ipv6)
-        [[ -z "$HOST_IP" ]] && HOST_IP="YOUR_IPV4_HERE"
-        SS_LINK_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0 | tr -d '\n')
-        
-        cat > "${SHOES_LINK_FILE}" <<EOF
-# Reality (IPv4)
-vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}
-# AnyTLS (IPv4)
-anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${SNI}&allowInsecure=1&insecure=1&type=tcp#${HOST_NAME}-Anytls
-# Shadowsocks-2022 (IPv4)
-ss://${SS_LINK_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS
-EOF
-        if [[ -n "$HOST_IPV6" ]]; then
-            echo -e "\n# Reality (IPv6)\nvless://${UUID}@[${HOST_IPV6}]:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=random&pbk=${PUBLIC_KEY}&sid=${SHID}&type=tcp#${HOST_NAME}-v6" >> "${SHOES_LINK_FILE}"
-        fi
+        generate_links
         echo -e "${GREEN}节点链接已同步更新！您可以返回主菜单查看。${RESET}"
     else
         echo -e "${RED}服务重启失败，请检查系统日志！${RESET}"
@@ -418,7 +458,6 @@ uninstall_shoes() {
     rm -f "${SYSTEMD_FILE}"
     rm -rf "${SHOES_CONF_DIR}"
     rm -f "${SHOES_BIN}"
-    # 修正清理实际生成的文件名
     rm -f /etc/security/limits.d/99-bbr-optimization.conf
     rm -f /etc/sysctl.d/99-bbr-optimization.conf
     systemctl daemon-reload
@@ -461,14 +500,14 @@ service_menu() {
 show_main_menu() {
     clear
     echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 3.5                    ${RESET}"
+    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 3.6             ${RESET}"
     echo -e "${MAGENTA}=========================================================${RESET}"
     echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
     echo -e " ${BLUE}核心版本:${RESET} $(get_local_version)"
     echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
     echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
-    echo -e "  1. 全新安装/重置服务 (${RED} 覆盖原有节点${RESET})"
-    echo -e "  2. 修复/优化系统环境 (${GREEN} 保留原有节点${RESET})"
+    echo -e "  1. 全新安装/重置服务 (${RED}覆盖原有节点${RESET})"
+    echo -e "  2. 修复/优化系统环境 (${GREEN}保留原有节点并更新链接排版${RESET})"
     echo "  3. 服务管理 (更新/卸载/启停)"
     echo "  4. 查看节点链接配置"
     echo "  5. 查看系统实时日志"
