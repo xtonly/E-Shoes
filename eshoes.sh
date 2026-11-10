@@ -12,8 +12,8 @@ WHITE='\033[1;37m'
 GRAY='\033[0;90m'
 RESET='\033[0m'
 
-LINE_HEAVY="${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-LINE_LIGHT="${GRAY}──────────────────────────────────────────────────────────${RESET}"
+LINE_HEAVY="${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+LINE_LIGHT="${GRAY}───────────────────────────────────────────────────────────────────${RESET}"
 
 # ================== 常量定义 ==================
 SHOES_BIN="/usr/local/bin/shoes"
@@ -27,7 +27,14 @@ IP_SYNC_SERVICE="/etc/systemd/system/shoes-ip-sync.service"
 IP_SYNC_TIMER="/etc/systemd/system/shoes-ip-sync.timer"
 SCRIPT_SOURCE="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
 TMP_DIR="/tmp/shoesdl"
-STARTUP_SYNC_MSG=""
+
+# 动态 IP 面板状态缓存变量
+SYNC_V4_CHANGED=0
+SYNC_V4_OLD=""
+SYNC_V6_CHANGED=0
+SYNC_V6_OLD=""
+CACHED_LIVE_V4=""
+CACHED_LIVE_V6=""
 
 # 端口范围常量：严格限制在 20300 之后 (20301 - 60000)
 PORT_MIN=20301
@@ -50,6 +57,103 @@ get_local_version() {
     else
         echo "未安装"
     fi
+}
+
+# 计算包含 ANSI 颜色与中英文混排字符串的终端显示宽度
+str_display_width() {
+    local s clean_sym c_chars c_bytes cjk
+    s=$(printf "%b" "$1" | sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g')
+    clean_sym=$(printf "%s" "$s" | sed 's/[●○✔→—─━│╭╮╰╯├┤┬┴┼]/X/g')
+    c_chars=${#clean_sym}
+    c_bytes=$(printf "%s" "$clean_sym" | wc -c)
+    cjk=$(( (c_bytes - c_chars) / 2 ))
+    echo $(( c_chars + cjk ))
+}
+
+# 按指定终端列宽填充或截断单元格
+pad_cell() {
+    local text="$1"
+    local target_w="$2"
+    local w pad
+    w=$(str_display_width "$text")
+    pad=$(( target_w - w ))
+    (( pad < 0 )) && pad=0
+    printf "%b%*s" "$text" "$pad" ""
+}
+
+# 双栏状态行输出
+print_kv_2col() {
+    local left
+    left=$(pad_cell "$1" 29)
+    echo -e "  ${left}  ${GRAY}│${RESET}  $2"
+}
+
+# 3列表格行输出 (总宽 67 列: 左缩进2 + 边框4 + 间距6 + 内容 8+23+24 = 67)
+print_ip_table_row() {
+    local c1 c2 c3
+    c1=$(pad_cell "$1" 8)
+    c2=$(pad_cell "$2" 23)
+    c3=$(pad_cell "$3" 24)
+    echo -e "  ${GRAY}│${RESET} ${c1} ${GRAY}│${RESET} ${c2} ${GRAY}│${RESET} ${c3} ${GRAY}│${RESET}"
+}
+
+# 优雅缩写超长文本 / DDNS 域名 / IPv6 地址以适配表格列宽
+shorten_middle() {
+    local str="$1"
+    local max_len="${2:-22}"
+    [[ -z "$str" ]] && { echo ""; return; }
+    if (( ${#str} <= max_len )); then
+        echo "$str"
+    else
+        local half=$(( (max_len - 2) / 2 ))
+        echo "${str:0:$half}..${str: -$half}"
+    fi
+}
+
+format_ipv6_short() {
+    local ip="$1"
+    local max_len="${2:-22}"
+    [[ -z "$ip" ]] && { echo ""; return; }
+    if (( ${#ip} <= max_len )); then
+        echo "$ip"
+    else
+        local h t
+        h=$(echo "$ip" | awk -F: '{print $1":"$2}')
+        t=$(echo "$ip" | awk -F: '{print $(NF-1)":"$NF}')
+        h="${h%:}"
+        t="${t#:}"
+        local res="${h}:..:${t}"
+        if (( ${#res} > max_len )); then
+            shorten_middle "$ip" "$max_len"
+        else
+            echo "$res"
+        fi
+    fi
+}
+
+compact_old_ipv4() {
+    local old="$1"
+    local new="$2"
+    [[ -z "$old" ]] && { echo "首次记录"; return; }
+    local o1 o2 o3 o4 n1 n2 n3 n4
+    IFS='.' read -r o1 o2 o3 o4 <<< "$old"
+    IFS='.' read -r n1 n2 n3 n4 <<< "$new"
+    if [[ "$o1.$o2" == "$n1.$n2" ]]; then
+        echo "原 .${o3}.${o4}"
+    elif (( ${#old} <= 11 )); then
+        echo "原 ${old}"
+    else
+        echo "原 ..${o3}.${o4}"
+    fi
+}
+
+compact_old_ipv6() {
+    local old="$1"
+    [[ -z "$old" ]] && { echo "新分配"; return; }
+    local t
+    t=$(echo "$old" | awk -F: '{print $NF}')
+    [[ -z "$t" ]] && t="0"
+    echo "原 ..:${t:0:6}"
 }
 
 # 检测端口是否被系统占用
@@ -523,51 +627,73 @@ sync_dynamic_ip() {
         setup_ip_sync_timer "quiet"
     fi
 
-    [[ "$mode" == "verbose" ]] && echo -e "\n${YELLOW}--> 正在实时核验当前公网 IP 与节点订阅状态...${RESET}"
+    [[ "$mode" == "verbose" ]] && echo -e "\n${YELLOW}--> 正在实时核验当前公网 IPv4 / IPv6 与节点订阅状态...${RESET}"
 
-    local live_v4 live_v6 old_v4 old_v6 need_regen=0
+    local live_v4 live_v6 old_v4 old_v6 need_regen=0 v4_diff=0 v6_diff=0
     live_v4=$(get_public_ipv4)
     live_v6=$(get_public_ipv6)
+    CACHED_LIVE_V4="$live_v4"
+    CACHED_LIVE_V6="$live_v6"
+
     old_v4="${LAST_IPV4:-$(extract_link_ipv4)}"
     old_v6="${LAST_IPV6:-$(extract_link_ipv6)}"
 
+    # 即使绑定了 DDNS 域名 (用于 IPv4 节点)，SS-2022 的 IPv6 置顶节点依然使用实时公网 IPv6，因此 IPv6 变动同样自动同步！
     if [[ -n "$CONNECT_HOST" ]]; then
-        [[ ! -f "${SHOES_LINK_FILE}" ]] && generate_links "quiet" "$live_v4" "$live_v6"
-        [[ "$mode" == "verbose" ]] && echo -e "${GREEN}--> 当前使用固定连接地址/DDNS: ${CYAN}${CONNECT_HOST}${RESET} ${GRAY}(机器实时公网 IP: ${live_v4:-未知})${RESET}"
+        if [[ ! -f "${SHOES_LINK_FILE}" ]] || [[ "$live_v6" != "$old_v6" ]]; then
+            [[ "$live_v6" != "$old_v6" ]] && v6_diff=1
+            generate_links "quiet" "${live_v4:-$old_v4}" "$live_v6"
+            if [[ "$v6_diff" -eq 1 ]]; then
+                SYNC_V6_CHANGED=1
+                SYNC_V6_OLD="$old_v6"
+                logger -t shoes-ip-sync "Dynamic IPv6 updated (DDNS mode): ${old_v6:-none}->${live_v6:-none}" 2>/dev/null || true
+            fi
+        fi
+        if [[ "$mode" == "verbose" ]]; then
+            echo -e "${GREEN}--> 当前 IPv4 节点绑定 DDNS/固定地址: ${CYAN}${CONNECT_HOST}${RESET} ${GRAY}(实时 IPv4: ${live_v4:-未知})${RESET}"
+            [[ -n "$live_v6" ]] && echo -e "${GREEN}--> 当前 IPv6 节点地址 (SS2022): ${CYAN}${live_v6}${RESET}"
+        fi
         return 0
     fi
 
-    # 网络瞬断无法探测公网 IPv4 时跳过重写，保护现有配置
+    # 网络瞬断无法探测公网 IPv4 且无有效 IPv6 变更时跳过重写，保护现有配置
     if [[ -z "$live_v4" ]]; then
-        [[ "$mode" == "verbose" ]] && echo -e "${YELLOW}--> 暂时无法探测外部公网 IP，当前显示上次缓存节点信息。${RESET}"
+        [[ "$mode" == "verbose" ]] && echo -e "${YELLOW}--> 暂时无法探测外部公网 IPv4，当前保留上次缓存节点信息。${RESET}"
         return 0
     fi
 
-    if [[ ! -f "${SHOES_LINK_FILE}" ]] || [[ "$live_v4" != "$old_v4" ]] || [[ "$live_v6" != "$old_v6" ]]; then
+    [[ "$live_v4" != "$old_v4" ]] && v4_diff=1
+    [[ "$live_v6" != "$old_v6" ]] && v6_diff=1
+
+    if [[ ! -f "${SHOES_LINK_FILE}" ]] || [[ "$v4_diff" -eq 1 ]] || [[ "$v6_diff" -eq 1 ]]; then
         need_regen=1
     fi
 
     if [[ "$need_regen" -eq 1 ]]; then
         generate_links "quiet" "$live_v4" "$live_v6"
         logger -t shoes-ip-sync "Dynamic IP updated: IPv4 ${old_v4:-none}->${live_v4}, IPv6 ${old_v6:-none}->${live_v6:-none}" 2>/dev/null || true
-        if [[ "$mode" == "startup" ]]; then
-            if [[ -n "$old_v4" ]] && [[ "$live_v4" != "$old_v4" ]]; then
-                STARTUP_SYNC_MSG="检测到动态 IP 变更 (${old_v4} -> ${live_v4})，节点链接已自动同步！"
-            else
-                STARTUP_SYNC_MSG="已自动同步最新动态公网 IP (${live_v4}) 至节点链接！"
-            fi
-        elif [[ "$mode" == "verbose" ]]; then
-            [[ "$live_v4" != "$old_v4" ]] && echo -e "${GREEN}--> 检测到动态 IPv4 已变更: ${YELLOW}${old_v4:-未知}${RESET} -> ${CYAN}${live_v4}${RESET}"
-            [[ "$live_v6" != "$old_v6" ]] && echo -e "${GREEN}--> 检测到动态 IPv6 已变更: ${YELLOW}${old_v6:-无}${RESET} -> ${CYAN}${live_v6:-无}${RESET}"
+        if [[ "$v4_diff" -eq 1 ]]; then
+            SYNC_V4_CHANGED=1
+            SYNC_V4_OLD="$old_v4"
+        fi
+        if [[ "$v6_diff" -eq 1 ]]; then
+            SYNC_V6_CHANGED=1
+            SYNC_V6_OLD="$old_v6"
+        fi
+        if [[ "$mode" == "verbose" ]]; then
+            [[ "$v4_diff" -eq 1 ]] && echo -e "${GREEN}--> 检测到动态 IPv4 已变更: ${YELLOW}${old_v4:-未知}${RESET} -> ${CYAN}${live_v4}${RESET}"
+            [[ "$v6_diff" -eq 1 ]] && echo -e "${GREEN}--> 检测到动态 IPv6 已变更: ${YELLOW}${old_v6:-无}${RESET} -> ${CYAN}${live_v6:-无}${RESET}"
             echo -e "${GREEN}--> 节点订阅链接已自动更新为最新公网 IP！${RESET}"
         fi
     else
-        if [[ -z "$LAST_IPV4" ]]; then
+        if [[ -z "$LAST_IPV4" ]] || [[ "$LAST_IPV6" != "$live_v6" ]]; then
             LAST_IPV4="$live_v4"
             LAST_IPV6="$live_v6"
             save_env_file
         fi
-        [[ "$mode" == "verbose" ]] && echo -e "${GREEN}--> 当前公网 IP 未变动 (${CYAN}${live_v4}${GREEN})，节点信息已是最新状态。${RESET}"
+        if [[ "$mode" == "verbose" ]]; then
+            echo -e "${GREEN}--> 当前公网 IP 未变动 (IPv4: ${CYAN}${live_v4}${GREEN}${live_v6:+ | IPv6: ${CYAN}${live_v6}${GREEN}})，节点已是最新状态。${RESET}"
+        fi
     fi
     return 0
 }
@@ -1141,23 +1267,58 @@ change_connect_host_menu() {
     while true; do
         source "${SHOES_ENV_FILE}"
         [[ -z "$ANYTLS_SNI" ]] && ANYTLS_SNI="cdn.cloudflare.net"
-        local live_v4 rec_v4 mode_desc
+        local live_v4 live_v6 rec_v4 rec_v6 v4_cell v6_cell v4_stat v6_stat
         live_v4=$(get_public_ipv4)
+        live_v6=$(get_public_ipv6)
+        CACHED_LIVE_V4="$live_v4"
+        CACHED_LIVE_V6="$live_v6"
         rec_v4="${LAST_IPV4:-$(extract_link_ipv4)}"
+        rec_v6="${LAST_IPV6:-$(extract_link_ipv6)}"
+
         if [[ -n "$CONNECT_HOST" ]]; then
-            mode_desc="${CYAN}固定域名/地址 (${CONNECT_HOST})${RESET}"
+            v4_cell="${CYAN}$(shorten_middle "$CONNECT_HOST" 22)${RESET}"
+            v4_stat="${CYAN}● DDNS/固定${RESET} ${GRAY}(${live_v4:-未知})${RESET}"
+            v4_stat=$(shorten_middle "$CONNECT_HOST" 1 >/dev/null; echo "${CYAN}● 固定地址${RESET}")
+            [[ -n "$live_v4" ]] && v4_stat="${CYAN}● 固定${RESET} ${GRAY}(公网 ${live_v4})${RESET}"
+            if (( $(str_display_width "$v4_stat") > 24 )); then
+                v4_stat="${CYAN}● DDNS / 固定地址模式${RESET}"
+            fi
         else
-            mode_desc="${GREEN}动态公网 IP 自动追踪 (每 5 分钟后台巡检)${RESET}"
+            v4_cell="${WHITE}${live_v4:-${rec_v4:-未获取}}${RESET}"
+            if [[ -n "$live_v4" ]] && [[ "$live_v4" == "$rec_v4" ]]; then
+                v4_stat="${GREEN}● 动态追踪 (已同步)${RESET}"
+            elif [[ -n "$live_v4" ]]; then
+                v4_stat="${YELLOW}● 待刷新 (${rec_v4:-无})${RESET}"
+            else
+                v4_stat="${RED}○ 公网探测超时${RESET}"
+            fi
+        fi
+
+        if [[ -n "$live_v6" ]]; then
+            v6_cell="${WHITE}$(format_ipv6_short "$live_v6" 22)${RESET}"
+            if [[ "$live_v6" == "$rec_v6" ]]; then
+                v6_stat="${GREEN}● 动态追踪 (仅SS节点)${RESET}"
+            else
+                v6_stat="${YELLOW}● 检测到新 IPv6 待刷新${RESET}"
+            fi
+        else
+            v6_cell="${GRAY}未分配 / 纯 IPv4 环境${RESET}"
+            v6_stat="${GRAY}— 未启用 IPv6 节点${RESET}"
         fi
 
         clear
         echo -e "${LINE_HEAVY}"
         echo -e "  ${CYAN}动态 IP 同步与节点连接地址设置${RESET}"
         echo -e "${LINE_HEAVY}"
-        echo -e "  ${GRAY}当前模式 :${RESET} ${mode_desc}"
-        echo -e "  ${GRAY}实时公网 :${RESET} ${WHITE}${live_v4:-获取失败}${RESET}  ${GRAY}(链接记录 IP: ${rec_v4:-无})${RESET}"
+        echo -e "  ${GRAY}╭──────────┬─────────────────────────┬──────────────────────────╮${RESET}"
+        print_ip_table_row "${GRAY}地址类型${RESET}" "${GRAY}当前节点地址 / 实时公网${RESET}" "${GRAY}追踪模式与同步状态${RESET}"
+        echo -e "  ${GRAY}├──────────┼─────────────────────────┼──────────────────────────┤${RESET}"
+        print_ip_table_row "${CYAN}IPv4${RESET}" "$v4_cell" "$v4_stat"
+        print_ip_table_row "${CYAN}IPv6${RESET}" "$v6_cell" "$v6_stat"
+        echo -e "  ${GRAY}╰──────────┴─────────────────────────┴──────────────────────────╯${RESET}"
+        [[ -n "$live_v6" ]] && (( ${#live_v6} > 22 )) && echo -e "  ${GRAY}完整 IPv6 : ${live_v6}${RESET}"
         echo -e "${LINE_LIGHT}"
-        echo -e "  ${CYAN}1.${RESET} ${WHITE}立即强制刷新动态公网 IP${RESET}  ${GRAY}— 重新探测最新 IP 并重写订阅链接${RESET}"
+        echo -e "  ${CYAN}1.${RESET} ${WHITE}立即强制刷新动态公网 IP${RESET}  ${GRAY}— 重新探测 IPv4/IPv6 并重写订阅链接${RESET}"
         echo -e "  ${CYAN}2.${RESET} ${WHITE}绑定 DDNS 域名/指定地址${RESET}  ${GRAY}— 填入 DDNS 域名，换 IP 免重导订阅${RESET}"
         echo -e "  ${CYAN}3.${RESET} ${WHITE}恢复自动追踪动态 IP 模式${RESET} ${GRAY}— 清除自定义域名，跟随实时公网 IP${RESET}"
         echo -e "${LINE_LIGHT}"
@@ -1289,36 +1450,90 @@ uninstall_shoes() {
     echo -e "${GREEN}Shoes 及其相关配置与防火墙规则已完全卸载。${RESET}"
 }
 
+# 渲染双栈动态地址状态表格 (供主菜单与服务管理共用)
+render_address_table() {
+    local v4_addr="未配置" v4_stat="${GRAY}— 等待安装部署${RESET}"
+    local v6_addr="未配置" v6_stat="${GRAY}— 等待安装部署${RESET}"
+
+    if [[ -f "${SHOES_ENV_FILE}" ]]; then
+        local env_conn env_v4 env_v6
+        env_conn=$(grep '^CONNECT_HOST=' "${SHOES_ENV_FILE}" | awk -F'"' '{print $2}')
+        env_v4=$(grep '^LAST_IPV4=' "${SHOES_ENV_FILE}" | awk -F'"' '{print $2}')
+        env_v6=$(grep '^LAST_IPV6=' "${SHOES_ENV_FILE}" | awk -F'"' '{print $2}')
+        [[ -z "$env_v4" ]] && env_v4=$(extract_link_ipv4)
+        [[ -z "$env_v6" ]] && env_v6=$(extract_link_ipv6)
+
+        # IPv4 行构造
+        if [[ -n "$env_conn" ]]; then
+            v4_addr="${CYAN}$(shorten_middle "$env_conn" 22)${RESET}"
+            v4_stat="${CYAN}● DDNS / 固定地址${RESET}"
+        elif [[ -n "$env_v4" ]]; then
+            v4_addr="${WHITE}${env_v4}${RESET}"
+            if [[ "$SYNC_V4_CHANGED" -eq 1 ]]; then
+                local old_s4
+                old_s4=$(compact_old_ipv4 "$SYNC_V4_OLD" "$env_v4")
+                v4_stat="${GREEN}✔ 已更新${RESET} ${GRAY}(${old_s4})${RESET}"
+            else
+                v4_stat="${GREEN}● 动态追踪 (每5分巡检)${RESET}"
+            fi
+        else
+            v4_addr="${YELLOW}未获取${RESET}"
+            v4_stat="${YELLOW}○ 等待公网探测${RESET}"
+        fi
+
+        # IPv6 行构造
+        if [[ -n "$env_v6" ]]; then
+            v6_addr="${WHITE}$(format_ipv6_short "$env_v6" 22)${RESET}"
+            if [[ "$SYNC_V6_CHANGED" -eq 1 ]]; then
+                local old_s6
+                old_s6=$(compact_old_ipv6 "$SYNC_V6_OLD")
+                v6_stat="${GREEN}✔ 已更新${RESET} ${GRAY}(${old_s6})${RESET}"
+            else
+                v6_stat="${GREEN}● 动态追踪 (仅SS节点)${RESET}"
+            fi
+        else
+            if [[ "$SYNC_V6_CHANGED" -eq 1 ]] && [[ -n "$SYNC_V6_OLD" ]]; then
+                v6_addr="${YELLOW}已失效 / 无 IPv6${RESET}"
+                v6_stat="${YELLOW}✔ 已移除旧 IPv6 节点${RESET}"
+            else
+                v6_addr="${GRAY}未分配 / 纯 IPv4 环境${RESET}"
+                v6_stat="${GRAY}— 未启用 IPv6 节点${RESET}"
+            fi
+        fi
+    fi
+
+    echo -e "  ${GRAY}╭──────────┬─────────────────────────┬──────────────────────────╮${RESET}"
+    print_ip_table_row "${GRAY}地址类型${RESET}" "${GRAY}当前生效地址${RESET}" "${GRAY}动态同步与状态${RESET}"
+    echo -e "  ${GRAY}├──────────┼─────────────────────────┼──────────────────────────┤${RESET}"
+    print_ip_table_row "${CYAN}IPv4${RESET}" "$v4_addr" "$v4_stat"
+    print_ip_table_row "${CYAN}IPv6${RESET}" "$v6_addr" "$v6_stat"
+    echo -e "  ${GRAY}╰──────────┴─────────────────────────┴──────────────────────────╯${RESET}"
+
+    # 展示过一次变更提示后归零，避免后续切屏重复高亮
+    SYNC_V4_CHANGED=0
+    SYNC_V6_CHANGED=0
+}
+
 service_menu() {
     while true; do
         clear
         local cur_sni="未配置"
         local cur_host="未配置"
-        local cur_addr="未配置"
         if [[ -f "${SHOES_ENV_FILE}" ]]; then
             cur_sni=$(grep '^SNI=' "${SHOES_ENV_FILE}" | awk -F'"' '{print $2}')
             cur_host=$(grep '^HOST_NAME=' "${SHOES_ENV_FILE}" | awk -F'"' '{print $2}')
-            local env_conn env_v4
-            env_conn=$(grep '^CONNECT_HOST=' "${SHOES_ENV_FILE}" | awk -F'"' '{print $2}')
-            env_v4=$(grep '^LAST_IPV4=' "${SHOES_ENV_FILE}" | awk -F'"' '{print $2}')
-            [[ -z "$env_v4" ]] && env_v4=$(extract_link_ipv4)
-            if [[ -n "$env_conn" ]]; then
-                cur_addr="${env_conn} ${GRAY}(DDNS/固定)${RESET}"
-            elif [[ -n "$env_v4" ]]; then
-                cur_addr="${env_v4} ${GRAY}(动态追踪)${RESET}"
-            fi
         fi
-        local ver_str
+        local ver_str ver_disp run_disp
         ver_str=$(get_local_version)
+        ver_disp=$( [[ "$ver_str" == "未安装" ]] && echo "${YELLOW}${ver_str}${RESET}" || echo "${CYAN}${ver_str}${RESET}" )
+        run_disp=$( check_running && echo "${GREEN}● 运行中${RESET}" || echo "${RED}○ 未运行${RESET}" )
+
         echo -e "${LINE_HEAVY}"
         echo -e "  ${CYAN}E-Shoes 节点与服务管理${RESET}"
         echo -e "${LINE_HEAVY}"
-        echo -e "  ${GRAY}核心版本 :${RESET} $( [[ "$ver_str" == "未安装" ]] && echo -e "${YELLOW}${ver_str}${RESET}" || echo -e "${CYAN}${ver_str}${RESET}" )"
-        echo -e "  ${GRAY}运行状态 :${RESET} $(check_running && echo -e "${GREEN}● 运行中${RESET}" || echo -e "${RED}○ 未运行${RESET}")"
-        echo -e "  ${GRAY}伪装域名 :${RESET} ${WHITE}${cur_sni}${RESET}"
-        echo -e "  ${GRAY}节点前缀 :${RESET} ${WHITE}${cur_host}${RESET}"
-        echo -e "  ${GRAY}连接地址 :${RESET} ${WHITE}${cur_addr}${RESET}"
-        echo -e "${LINE_LIGHT}"
+        print_kv_2col "${GRAY}核心版本 :${RESET} ${ver_disp}" "${GRAY}运行状态 :${RESET} ${run_disp}"
+        print_kv_2col "${GRAY}伪装域名 :${RESET} ${WHITE}$(shorten_middle "$cur_sni" 18)${RESET}" "${GRAY}节点前缀 :${RESET} ${WHITE}${cur_host}${RESET}"
+        render_address_table
         echo -e "  ${CYAN}1.${RESET} ${WHITE}更新核心版本${RESET}  ${GRAY}— 保留现有配置升级 Shoes 核心${RESET}"
         echo -e "  ${CYAN}2.${RESET} ${WHITE}卸载节点服务${RESET}  ${GRAY}— 彻底清理程序、配置及放行规则${RESET}"
         echo -e "  ${CYAN}3.${RESET} ${WHITE}启动节点服务${RESET}  ${GRAY}— 启动 Shoes 系统守护进程${RESET}"
@@ -1356,38 +1571,24 @@ service_menu() {
 # ================== 主菜单 ==================
 show_main_menu() {
     clear
-    local fw_status ver_str addr_display="未配置"
+    local fw_status ver_str inst_disp run_disp ver_disp fw_disp
     fw_status=$(detect_firewall)
     ver_str=$(get_local_version)
-    if [[ -f "${SHOES_ENV_FILE}" ]]; then
-        local env_conn env_v4
-        env_conn=$(grep '^CONNECT_HOST=' "${SHOES_ENV_FILE}" | awk -F'"' '{print $2}')
-        env_v4=$(grep '^LAST_IPV4=' "${SHOES_ENV_FILE}" | awk -F'"' '{print $2}')
-        [[ -z "$env_v4" ]] && env_v4=$(extract_link_ipv4)
-        if [[ -n "$env_conn" ]]; then
-            addr_display="${CYAN}${env_conn}${RESET} ${GRAY}(DDNS/固定地址)${RESET}"
-        elif [[ -n "$env_v4" ]]; then
-            addr_display="${WHITE}${env_v4}${RESET} ${GRAY}(动态IP自动同步)${RESET}"
-        fi
-    fi
+    inst_disp=$( check_installed && echo "${GREEN}● 已安装${RESET}" || echo "${YELLOW}○ 未安装${RESET}" )
+    run_disp=$( check_running && echo "${GREEN}● 运行中${RESET}" || echo "${RED}○ 未运行${RESET}" )
+    ver_disp=$( [[ "$ver_str" == "未安装" ]] && echo "${YELLOW}${ver_str}${RESET}" || echo "${CYAN}${ver_str}${RESET}" )
+    fw_disp=$( [[ "$fw_status" == "none" ]] && echo "${GREEN}● 未启用 (全放行)${RESET}" || echo "${YELLOW}● ${fw_status} (运行中)${RESET}" )
 
     echo -e "${LINE_HEAVY}"
-    echo -e "  ${CYAN}E-Shoes 代理节点一键管理脚本${RESET} ${GRAY}v4.3${RESET}"
+    echo -e "  ${CYAN}E-Shoes 代理节点一键管理脚本${RESET} ${GRAY}v4.4${RESET}"
     echo -e "${LINE_HEAVY}"
-    echo -e "  ${GRAY}服务状态 :${RESET} $(check_installed && echo -e "${GREEN}● 已安装${RESET}" || echo -e "${YELLOW}○ 未安装${RESET}")"
-    echo -e "  ${GRAY}运行状态 :${RESET} $(check_running && echo -e "${GREEN}● 运行中${RESET}" || echo -e "${RED}○ 未运行${RESET}")"
-    echo -e "  ${GRAY}核心版本 :${RESET} $( [[ "$ver_str" == "未安装" ]] && echo -e "${YELLOW}${ver_str}${RESET}" || echo -e "${CYAN}${ver_str}${RESET}" )"
-    echo -e "  ${GRAY}防护状态 :${RESET} $( [[ "$fw_status" == "none" ]] && echo -e "${GREEN}● 未启用 (默认全放行)${RESET}" || echo -e "${YELLOW}● ${fw_status} (运行中)${RESET}" )"
-    echo -e "  ${GRAY}节点地址 :${RESET} ${addr_display}"
-    if [[ -n "$STARTUP_SYNC_MSG" ]]; then
-        echo -e "  ${GREEN}✔ ${STARTUP_SYNC_MSG}${RESET}"
-        STARTUP_SYNC_MSG=""
-    fi
-    echo -e "${LINE_LIGHT}"
+    print_kv_2col "${GRAY}服务状态 :${RESET} ${inst_disp}" "${GRAY}运行状态 :${RESET} ${run_disp}"
+    print_kv_2col "${GRAY}核心版本 :${RESET} ${ver_disp}" "${GRAY}防护状态 :${RESET} ${fw_disp}"
+    render_address_table
     echo -e "  ${CYAN}1.${RESET} ${WHITE}全新安装部署${RESET}  ${GRAY}— 随机分配 >20300 端口并自动放行${RESET}"
     echo -e "  ${CYAN}2.${RESET} ${WHITE}修复系统环境${RESET}  ${GRAY}— 保留原有节点配置并同步防火墙${RESET}"
     echo -e "  ${CYAN}3.${RESET} ${WHITE}节点服务管理${RESET}  ${GRAY}— 更新 / 卸载 / 改端口 / 改SNI / 改地址${RESET}"
-    echo -e "  ${CYAN}4.${RESET} ${WHITE}查看节点链接${RESET}  ${GRAY}— 实时校准动态公网 IP 并输出订阅${RESET}"
+    echo -e "  ${CYAN}4.${RESET} ${WHITE}查看节点链接${RESET}  ${GRAY}— 实时校准双栈动态 IP 并输出订阅${RESET}"
     echo -e "  ${CYAN}5.${RESET} ${WHITE}查看实时日志${RESET}  ${GRAY}— 追踪 Shoes 核心运行状态与排错${RESET}"
     echo -e "${LINE_LIGHT}"
     echo -e "  ${CYAN}0.${RESET} ${WHITE}退出管理脚本${RESET}"
