@@ -22,7 +22,12 @@ SHOES_CONF_FILE="${SHOES_CONF_DIR}/config.yaml"
 SHOES_LINK_FILE="${SHOES_CONF_DIR}/config.txt"
 SHOES_ENV_FILE="${SHOES_CONF_DIR}/.env"
 SYSTEMD_FILE="/etc/systemd/system/shoes.service"
+IP_SYNC_BIN="/usr/local/bin/shoes-ip-sync"
+IP_SYNC_SERVICE="/etc/systemd/system/shoes-ip-sync.service"
+IP_SYNC_TIMER="/etc/systemd/system/shoes-ip-sync.timer"
+SCRIPT_SOURCE="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
 TMP_DIR="/tmp/shoesdl"
+STARTUP_SYNC_MSG=""
 
 # 端口范围常量：严格限制在 20300 之后 (20301 - 60000)
 PORT_MIN=20301
@@ -295,12 +300,12 @@ sync_system_time() {
     echo -e "${GREEN}时间同步完成，当前服务器时间: $(date)${RESET}"
 }
 
-# === 智能 IP 获取 ===
+# === 智能动态公网 IP 获取 (防缓存 + 亚太/全球极速源) ===
 get_public_ipv4() {
     local ip=""
-    for url in "http://checkip.amazonaws.com" "http://ifconfig.me/ip" "http://api.ipify.org"; do
-        ip=$(curl -s -4 --max-time 5 "$url" | tr -d '[:space:]')
-        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    for url in "https://4.ipw.cn" "https://api.ipify.org" "https://ipv4.icanhazip.com" "http://checkip.amazonaws.com"; do
+        ip=$(curl -fsSL -4 --connect-timeout 2 --max-time 3 -H "Cache-Control: no-cache" "$url" 2>/dev/null | tr -d '[:space:]')
+        if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
             echo "$ip"
             return
         fi
@@ -309,10 +314,12 @@ get_public_ipv4() {
 }
 
 get_public_ipv6() {
+    # 若网卡无全局 IPv6 地址则直接跳过探测，避免单栈机器超时等待
+    ip -6 addr show scope global 2>/dev/null | grep -q "inet6" || { echo ""; return; }
     local ip=""
-    for url in "http://ifconfig.co/ip" "http://icanhazip.com" "http://api64.ipify.org"; do
-        ip=$(curl -s -6 --max-time 5 "$url" | tr -d '[:space:]')
-        if [[ "$ip" == *":"* ]] && [[ "$ip" != *"<"* ]]; then
+    for url in "https://6.ipw.cn" "https://ipv6.icanhazip.com" "https://api6.ipify.org"; do
+        ip=$(curl -fsSL -6 --connect-timeout 2 --max-time 3 -H "Cache-Control: no-cache" "$url" 2>/dev/null | tr -d '[:space:]')
+        if [[ "$ip" == *":"* ]] && [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then
             echo "$ip"
             return
         fi
@@ -320,8 +327,16 @@ get_public_ipv6() {
     echo ""
 }
 
-# ================== 配置文件写入函数 ==================
-write_shoes_configs() {
+extract_link_ipv4() {
+    [[ -f "${SHOES_LINK_FILE}" ]] && grep -oE '@([0-9]{1,3}\.){3}[0-9]{1,3}:' "${SHOES_LINK_FILE}" 2>/dev/null | head -n 1 | tr -d '@:' || echo ""
+}
+
+extract_link_ipv6() {
+    [[ -f "${SHOES_LINK_FILE}" ]] && grep -oE '@\[[0-9a-fA-F:]+\]:' "${SHOES_LINK_FILE}" 2>/dev/null | head -n 1 | tr -d '@[]:' || echo ""
+}
+
+save_env_file() {
+    mkdir -p "${SHOES_CONF_DIR}"
     cat > "${SHOES_ENV_FILE}" <<EOF
 UUID="${UUID}"
 PRIVATE_KEY="${PRIVATE_KEY}"
@@ -335,7 +350,15 @@ SS_PORT="${SS_PORT}"
 HOST_NAME="${HOST_NAME}"
 SNI="${SNI}"
 ANYTLS_SNI="${ANYTLS_SNI}"
+CONNECT_HOST="${CONNECT_HOST}"
+LAST_IPV4="${LAST_IPV4}"
+LAST_IPV6="${LAST_IPV6}"
 EOF
+}
+
+# ================== 配置文件写入函数 ==================
+write_shoes_configs() {
+    save_env_file
 
     if ip a | grep -qw inet6; then
         BIND_ADDR="[::]"
@@ -381,51 +404,172 @@ EOF
 EOF
 }
 
-# ================== 节点链接生成函数 (VLESS 与 AnyTLS 仅保留 IPv4) ==================
+# ================== 节点链接生成函数 (支持最新动态 IP 与自定义 DDNS) ==================
 generate_links() {
-    HOST_IP=$(get_public_ipv4)
-    HOST_IPV6=$(get_public_ipv6)
+    local quiet_mode="$1"
+    local live_v4="$2"
+    local live_v6="$3"
+    local target_host
 
-    if [[ -z "$HOST_IP" ]]; then
-        echo -e "${RED}警告：无法自动获取 IPv4 地址，链接中将使用占位符。${RESET}"
-        HOST_IP="YOUR_IPV4_HERE"
+    [[ -z "$live_v4" ]] && live_v4=$(get_public_ipv4)
+    [[ -z "$live_v6" ]] && live_v6=$(get_public_ipv6)
+
+    if [[ -n "$live_v4" ]]; then
+        LAST_IPV4="$live_v4"
+        [[ "$quiet_mode" != "quiet" ]] && echo -e "${GREEN}成功获取最新公网 IPv4: ${LAST_IPV4}${RESET}"
     else
-        echo -e "${GREEN}成功获取 IPv4: ${HOST_IP}${RESET}"
+        [[ "$quiet_mode" != "quiet" ]] && echo -e "${RED}警告：无法探测公网 IPv4，将使用缓存或占位符。${RESET}"
     fi
 
-    [[ -n "$HOST_IPV6" ]] && echo -e "${GREEN}成功获取 IPv6: ${HOST_IPV6}${RESET} (仅用于 SS2022 置顶节点)"
+    if [[ -n "$live_v6" ]]; then
+        LAST_IPV6="$live_v6"
+        [[ "$quiet_mode" != "quiet" ]] && echo -e "${GREEN}成功获取最新公网 IPv6: ${LAST_IPV6}${RESET} (仅用于 SS2022 置顶节点)"
+    else
+        LAST_IPV6=""
+    fi
+
+    if [[ -n "$CONNECT_HOST" ]]; then
+        target_host="$CONNECT_HOST"
+        [[ "$quiet_mode" != "quiet" ]] && echo -e "${CYAN}当前节点连接地址使用自定义域名/IP: ${target_host}${RESET}"
+    else
+        target_host="${LAST_IPV4:-YOUR_IPV4_HERE}"
+    fi
+
+    [[ -f "${SHOES_ENV_FILE}" ]] && save_env_file
 
     SS_LINK_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0 | tr -d '\n')
 
-    # 1. 置顶输出 Shadowsocks-2022 (支持 IPv4 & IPv6)
+    # 1. 置顶输出 Shadowsocks-2022 (支持 IPv4/DDNS & IPv6)
     cat > "${SHOES_LINK_FILE}" <<EOF
 # ==================== [置顶] Shadowsocks-2022 ====================
 # SS2022 (IPv4)
-ss://${SS_LINK_BASE}@${HOST_IP}:${SS_PORT}#${HOST_NAME}-SS
+ss://${SS_LINK_BASE}@${target_host}:${SS_PORT}#${HOST_NAME}-SS
 EOF
 
-    if [[ -n "$HOST_IPV6" ]]; then
+    if [[ -n "$LAST_IPV6" ]]; then
         cat >> "${SHOES_LINK_FILE}" <<EOF
 # SS2022 (IPv6)
-ss://${SS_LINK_BASE}@[${HOST_IPV6}]:${SS_PORT}#${HOST_NAME}-SS-V6
+ss://${SS_LINK_BASE}@[${LAST_IPV6}]:${SS_PORT}#${HOST_NAME}-SS-V6
 EOF
     fi
 
-    # 2. 其他协议分组：VLESS-Reality (仅保留 IPv4)
+    # 2. 其他协议分组：VLESS-Reality (仅保留 IPv4/DDNS)
     cat >> "${SHOES_LINK_FILE}" <<EOF
 
 # ==================== [分组 1] VLESS-Reality ====================
 # Reality (IPv4)
-vless://${UUID}@${HOST_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHID}&spx=%2F&type=tcp#${HOST_NAME}-Reality
+vless://${UUID}@${target_host}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHID}&spx=%2F&type=tcp#${HOST_NAME}-Reality
 EOF
 
-    # 3. 其他协议分组：AnyTLS (仅保留 IPv4)
+    # 3. 其他协议分组：AnyTLS (仅保留 IPv4/DDNS)
     cat >> "${SHOES_LINK_FILE}" <<EOF
 
 # ==================== [分组 2] AnyTLS ====================
 # AnyTLS (IPv4)
-anytls://${PUBLIC_KEY}@${HOST_IP}:${ANYTLS_PORT}?security=tls&sni=${ANYTLS_SNI}&allowInsecure=1&insecure=1&type=tcp#${HOST_NAME}-AnyTLS
+anytls://${PUBLIC_KEY}@${target_host}:${ANYTLS_PORT}?security=tls&sni=${ANYTLS_SNI}&allowInsecure=1&insecure=1&type=tcp#${HOST_NAME}-AnyTLS
 EOF
+}
+
+# ================== 动态公网 IP 自动巡检与实时同步引擎 ==================
+setup_ip_sync_timer() {
+    local quiet_mode="$1"
+    if [[ -f "$SCRIPT_SOURCE" ]] && grep -q "SHOES_CONF_DIR" "$SCRIPT_SOURCE" 2>/dev/null; then
+        cp -f "$SCRIPT_SOURCE" "${IP_SYNC_BIN}"
+        chmod +x "${IP_SYNC_BIN}"
+    fi
+    [[ ! -x "${IP_SYNC_BIN}" ]] && return
+
+    cat > "${IP_SYNC_SERVICE}" <<EOF
+[Unit]
+Description=Shoes Dynamic Public IP Link Sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${IP_SYNC_BIN} --sync-ip
+EOF
+
+    cat > "${IP_SYNC_TIMER}" <<EOF
+[Unit]
+Description=Periodic Dynamic IP Check for Shoes Links
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload >/dev/null 2>&1
+    systemctl enable --now shoes-ip-sync.timer >/dev/null 2>&1
+    [[ "$quiet_mode" != "quiet" ]] && echo -e "${GREEN}--> 已启用动态公网 IP 后台自动同步定时任务 (每 5 分钟巡检更新)${RESET}"
+}
+
+sync_dynamic_ip() {
+    local mode="$1" # cron | startup | verbose
+    if [[ ! -f "${SHOES_ENV_FILE}" ]]; then
+        [[ "$mode" == "verbose" ]] && echo -e "\n${YELLOW}配置文件不存在，请先执行安装步骤。${RESET}"
+        return 1
+    fi
+
+    source "${SHOES_ENV_FILE}"
+    [[ -z "$ANYTLS_SNI" ]] && ANYTLS_SNI="cdn.cloudflare.net"
+
+    # 若旧版尚未配置后台同步器，平滑自动补齐
+    if [[ "$mode" != "cron" ]] && check_installed && [[ ! -f "${IP_SYNC_TIMER}" ]]; then
+        setup_ip_sync_timer "quiet"
+    fi
+
+    [[ "$mode" == "verbose" ]] && echo -e "\n${YELLOW}--> 正在实时核验当前公网 IP 与节点订阅状态...${RESET}"
+
+    local live_v4 live_v6 old_v4 old_v6 need_regen=0
+    live_v4=$(get_public_ipv4)
+    live_v6=$(get_public_ipv6)
+    old_v4="${LAST_IPV4:-$(extract_link_ipv4)}"
+    old_v6="${LAST_IPV6:-$(extract_link_ipv6)}"
+
+    if [[ -n "$CONNECT_HOST" ]]; then
+        [[ ! -f "${SHOES_LINK_FILE}" ]] && generate_links "quiet" "$live_v4" "$live_v6"
+        [[ "$mode" == "verbose" ]] && echo -e "${GREEN}--> 当前使用固定连接地址/DDNS: ${CYAN}${CONNECT_HOST}${RESET} ${GRAY}(机器实时公网 IP: ${live_v4:-未知})${RESET}"
+        return 0
+    fi
+
+    # 网络瞬断无法探测公网 IPv4 时跳过重写，保护现有配置
+    if [[ -z "$live_v4" ]]; then
+        [[ "$mode" == "verbose" ]] && echo -e "${YELLOW}--> 暂时无法探测外部公网 IP，当前显示上次缓存节点信息。${RESET}"
+        return 0
+    fi
+
+    if [[ ! -f "${SHOES_LINK_FILE}" ]] || [[ "$live_v4" != "$old_v4" ]] || [[ "$live_v6" != "$old_v6" ]]; then
+        need_regen=1
+    fi
+
+    if [[ "$need_regen" -eq 1 ]]; then
+        generate_links "quiet" "$live_v4" "$live_v6"
+        logger -t shoes-ip-sync "Dynamic IP updated: IPv4 ${old_v4:-none}->${live_v4}, IPv6 ${old_v6:-none}->${live_v6:-none}" 2>/dev/null || true
+        if [[ "$mode" == "startup" ]]; then
+            if [[ -n "$old_v4" ]] && [[ "$live_v4" != "$old_v4" ]]; then
+                STARTUP_SYNC_MSG="检测到动态 IP 变更 (${old_v4} -> ${live_v4})，节点链接已自动同步！"
+            else
+                STARTUP_SYNC_MSG="已自动同步最新动态公网 IP (${live_v4}) 至节点链接！"
+            fi
+        elif [[ "$mode" == "verbose" ]]; then
+            [[ "$live_v4" != "$old_v4" ]] && echo -e "${GREEN}--> 检测到动态 IPv4 已变更: ${YELLOW}${old_v4:-未知}${RESET} -> ${CYAN}${live_v4}${RESET}"
+            [[ "$live_v6" != "$old_v6" ]] && echo -e "${GREEN}--> 检测到动态 IPv6 已变更: ${YELLOW}${old_v6:-无}${RESET} -> ${CYAN}${live_v6:-无}${RESET}"
+            echo -e "${GREEN}--> 节点订阅链接已自动更新为最新公网 IP！${RESET}"
+        fi
+    else
+        if [[ -z "$LAST_IPV4" ]]; then
+            LAST_IPV4="$live_v4"
+            LAST_IPV6="$live_v6"
+            save_env_file
+        fi
+        [[ "$mode" == "verbose" ]] && echo -e "${GREEN}--> 当前公网 IP 未变动 (${CYAN}${live_v4}${GREEN})，节点信息已是最新状态。${RESET}"
+    fi
+    return 0
 }
 
 # ================== 架构检测与下载 ==================
@@ -578,6 +722,9 @@ install_shoes() {
         
         SNI="www.apple.com"
         ANYTLS_SNI="cdn.cloudflare.net"
+        CONNECT_HOST=""
+        LAST_IPV4=""
+        LAST_IPV6=""
 
         systemctl stop shoes >/dev/null 2>&1
 
@@ -672,6 +819,7 @@ EOF
     if check_running; then
         echo -e "${YELLOW}--> 正在生成节点订阅链接 (VLESS/AnyTLS 仅保留 IPv4)...${RESET}"
         generate_links
+        setup_ip_sync_timer
         
         echo -e "\n${GREEN}Shoes 部署完成！当前分配端口均在 20300 之后：${RESET}"
         echo -e "  - ${CYAN}SS-2022 端口:${RESET} ${SS_PORT} (含 IPv4 & IPv6)"
@@ -983,6 +1131,98 @@ change_hostname_menu() {
     echo -e "${LINE_LIGHT}"
 }
 
+# ================== 动态 IP 刷新与连接地址 (DDNS) 管理 ==================
+change_connect_host_menu() {
+    if [[ ! -f "${SHOES_ENV_FILE}" ]] || [[ ! -f "${SHOES_CONF_FILE}" ]]; then
+        echo -e "\n${RED}错误：未检测到已安装的配置文件，请先执行安装！${RESET}"
+        return
+    fi
+
+    while true; do
+        source "${SHOES_ENV_FILE}"
+        [[ -z "$ANYTLS_SNI" ]] && ANYTLS_SNI="cdn.cloudflare.net"
+        local live_v4 rec_v4 mode_desc
+        live_v4=$(get_public_ipv4)
+        rec_v4="${LAST_IPV4:-$(extract_link_ipv4)}"
+        if [[ -n "$CONNECT_HOST" ]]; then
+            mode_desc="${CYAN}固定域名/地址 (${CONNECT_HOST})${RESET}"
+        else
+            mode_desc="${GREEN}动态公网 IP 自动追踪 (每 5 分钟后台巡检)${RESET}"
+        fi
+
+        clear
+        echo -e "${LINE_HEAVY}"
+        echo -e "  ${CYAN}动态 IP 同步与节点连接地址设置${RESET}"
+        echo -e "${LINE_HEAVY}"
+        echo -e "  ${GRAY}当前模式 :${RESET} ${mode_desc}"
+        echo -e "  ${GRAY}实时公网 :${RESET} ${WHITE}${live_v4:-获取失败}${RESET}  ${GRAY}(链接记录 IP: ${rec_v4:-无})${RESET}"
+        echo -e "${LINE_LIGHT}"
+        echo -e "  ${CYAN}1.${RESET} ${WHITE}立即强制刷新动态公网 IP${RESET}  ${GRAY}— 重新探测最新 IP 并重写订阅链接${RESET}"
+        echo -e "  ${CYAN}2.${RESET} ${WHITE}绑定 DDNS 域名/指定地址${RESET}  ${GRAY}— 填入 DDNS 域名，换 IP 免重导订阅${RESET}"
+        echo -e "  ${CYAN}3.${RESET} ${WHITE}恢复自动追踪动态 IP 模式${RESET} ${GRAY}— 清除自定义域名，跟随实时公网 IP${RESET}"
+        echo -e "${LINE_LIGHT}"
+        echo -e "  ${CYAN}0.${RESET} ${WHITE}返回上级菜单${RESET}"
+        echo -e "${LINE_HEAVY}"
+        echo -ne "  ${WHITE}请选择操作 [0-3]: ${RESET}"
+        read -r addr_choice
+
+        case "$addr_choice" in
+            1)
+                echo -e "\n${YELLOW}--> 正在强制重新探测公网 IP 并刷新节点链接...${RESET}"
+                generate_links
+                setup_ip_sync_timer "quiet"
+                echo -e "${GREEN}节点链接已强制更新！${RESET}"
+                echo -e "${LINE_LIGHT}"
+                cat "${SHOES_LINK_FILE}"
+                echo -e "${LINE_LIGHT}"
+                echo "" && read -n 1 -s -r -p "按任意键继续..."
+                ;;
+            2)
+                echo ""
+                echo -ne "  ${WHITE}请输入 DDNS 域名或指定连接 IP (直接回车取消): ${RESET}"
+                read -r custom_host
+                custom_host=$(echo "$custom_host" | tr -d '[:space:]' | sed -E 's#^https?://##; s#/.*$##; s#:[0-9]+$##')
+                if [[ -z "$custom_host" ]]; then
+                    echo -e "  ${YELLOW}未输入内容，已取消修改。${RESET}"
+                    sleep 1
+                    continue
+                fi
+                if ! [[ "$custom_host" =~ ^[a-zA-Z0-9.-]+$ ]]; then
+                    echo -e "  ${RED}错误：输入的域名或 IP 格式无效！${RESET}"
+                    sleep 1.5
+                    continue
+                fi
+                CONNECT_HOST="$custom_host"
+                save_env_file
+                generate_links
+                echo -e "\n${GREEN}--> 已绑定连接地址为: ${CONNECT_HOST} (无需重启服务)${RESET}"
+                echo -e "${LINE_LIGHT}"
+                cat "${SHOES_LINK_FILE}"
+                echo -e "${LINE_LIGHT}"
+                echo "" && read -n 1 -s -r -p "按任意键继续..."
+                ;;
+            3)
+                CONNECT_HOST=""
+                save_env_file
+                echo -e "\n${YELLOW}--> 已切换回自动追踪动态公网 IP 模式，正在同步当前 IP...${RESET}"
+                generate_links
+                setup_ip_sync_timer "quiet"
+                echo -e "${LINE_LIGHT}"
+                cat "${SHOES_LINK_FILE}"
+                echo -e "${LINE_LIGHT}"
+                echo "" && read -n 1 -s -r -p "按任意键继续..."
+                ;;
+            0)
+                return
+                ;;
+            *)
+                echo -e "${RED}无效选项，请重新输入！${RESET}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
 # ================== 证书管理 ==================
 update_certificate() {
     echo -e "\n${YELLOW}--> 正在重新生成 TLS 证书...${RESET}"
@@ -1035,6 +1275,9 @@ uninstall_shoes() {
             fw_reload_save "$fw_type"
         fi
     fi
+    systemctl stop shoes-ip-sync.timer shoes-ip-sync.service >/dev/null 2>&1
+    systemctl disable shoes-ip-sync.timer shoes-ip-sync.service >/dev/null 2>&1
+    rm -f "${IP_SYNC_TIMER}" "${IP_SYNC_SERVICE}" "${IP_SYNC_BIN}"
     systemctl stop shoes >/dev/null 2>&1
     systemctl disable shoes >/dev/null 2>&1
     rm -f "${SYSTEMD_FILE}"
@@ -1051,9 +1294,19 @@ service_menu() {
         clear
         local cur_sni="未配置"
         local cur_host="未配置"
+        local cur_addr="未配置"
         if [[ -f "${SHOES_ENV_FILE}" ]]; then
             cur_sni=$(grep '^SNI=' "${SHOES_ENV_FILE}" | awk -F'"' '{print $2}')
             cur_host=$(grep '^HOST_NAME=' "${SHOES_ENV_FILE}" | awk -F'"' '{print $2}')
+            local env_conn env_v4
+            env_conn=$(grep '^CONNECT_HOST=' "${SHOES_ENV_FILE}" | awk -F'"' '{print $2}')
+            env_v4=$(grep '^LAST_IPV4=' "${SHOES_ENV_FILE}" | awk -F'"' '{print $2}')
+            [[ -z "$env_v4" ]] && env_v4=$(extract_link_ipv4)
+            if [[ -n "$env_conn" ]]; then
+                cur_addr="${env_conn} ${GRAY}(DDNS/固定)${RESET}"
+            elif [[ -n "$env_v4" ]]; then
+                cur_addr="${env_v4} ${GRAY}(动态追踪)${RESET}"
+            fi
         fi
         local ver_str
         ver_str=$(get_local_version)
@@ -1064,6 +1317,7 @@ service_menu() {
         echo -e "  ${GRAY}运行状态 :${RESET} $(check_running && echo -e "${GREEN}● 运行中${RESET}" || echo -e "${RED}○ 未运行${RESET}")"
         echo -e "  ${GRAY}伪装域名 :${RESET} ${WHITE}${cur_sni}${RESET}"
         echo -e "  ${GRAY}节点前缀 :${RESET} ${WHITE}${cur_host}${RESET}"
+        echo -e "  ${GRAY}连接地址 :${RESET} ${WHITE}${cur_addr}${RESET}"
         echo -e "${LINE_LIGHT}"
         echo -e "  ${CYAN}1.${RESET} ${WHITE}更新核心版本${RESET}  ${GRAY}— 保留现有配置升级 Shoes 核心${RESET}"
         echo -e "  ${CYAN}2.${RESET} ${WHITE}卸载节点服务${RESET}  ${GRAY}— 彻底清理程序、配置及放行规则${RESET}"
@@ -1075,10 +1329,11 @@ service_menu() {
         echo -e "  ${CYAN}7.${RESET} ${WHITE}修改协议端口${RESET}  ${GRAY}— 单独或随机换端口，自动同步防火墙${RESET}"
         echo -e "  ${CYAN}8.${RESET} ${WHITE}修改伪装域名${RESET}  ${GRAY}— 切换预设/自定义 Reality 与 AnyTLS${RESET}"
         echo -e "  ${CYAN}9.${RESET} ${WHITE}修改节点前缀${RESET}  ${GRAY}— 自定义节点别名 (无需重启服务)${RESET}"
+        echo -e " ${CYAN}10.${RESET} ${WHITE}设置节点地址${RESET}  ${GRAY}— 强制刷新动态 IP 或绑定 DDNS 域名${RESET}"
         echo -e "${LINE_LIGHT}"
         echo -e "  ${CYAN}0.${RESET} ${WHITE}返回上级菜单${RESET}"
         echo -e "${LINE_HEAVY}"
-        echo -ne "  ${WHITE}请选择操作 [0-9]: ${RESET}"
+        echo -ne "  ${WHITE}请选择操作 [0-10]: ${RESET}"
         read -r sub_choice
 
         case "$sub_choice" in
@@ -1091,6 +1346,7 @@ service_menu() {
             7) change_ports_menu ;;
             8) change_sni_menu ;;
             9) change_hostname_menu; echo "" && read -n 1 -s -r -p "按任意键返回..." ;;
+            10) change_connect_host_menu ;;
             0) return ;;
             *) echo -e "${RED}无效选项，请重新输入！${RESET}"; sleep 1 ;;
         esac
@@ -1100,21 +1356,38 @@ service_menu() {
 # ================== 主菜单 ==================
 show_main_menu() {
     clear
-    local fw_status ver_str
+    local fw_status ver_str addr_display="未配置"
     fw_status=$(detect_firewall)
     ver_str=$(get_local_version)
+    if [[ -f "${SHOES_ENV_FILE}" ]]; then
+        local env_conn env_v4
+        env_conn=$(grep '^CONNECT_HOST=' "${SHOES_ENV_FILE}" | awk -F'"' '{print $2}')
+        env_v4=$(grep '^LAST_IPV4=' "${SHOES_ENV_FILE}" | awk -F'"' '{print $2}')
+        [[ -z "$env_v4" ]] && env_v4=$(extract_link_ipv4)
+        if [[ -n "$env_conn" ]]; then
+            addr_display="${CYAN}${env_conn}${RESET} ${GRAY}(DDNS/固定地址)${RESET}"
+        elif [[ -n "$env_v4" ]]; then
+            addr_display="${WHITE}${env_v4}${RESET} ${GRAY}(动态IP自动同步)${RESET}"
+        fi
+    fi
+
     echo -e "${LINE_HEAVY}"
-    echo -e "  ${CYAN}E-Shoes 代理节点一键管理脚本${RESET} ${GRAY}v4.2${RESET}"
+    echo -e "  ${CYAN}E-Shoes 代理节点一键管理脚本${RESET} ${GRAY}v4.3${RESET}"
     echo -e "${LINE_HEAVY}"
     echo -e "  ${GRAY}服务状态 :${RESET} $(check_installed && echo -e "${GREEN}● 已安装${RESET}" || echo -e "${YELLOW}○ 未安装${RESET}")"
     echo -e "  ${GRAY}运行状态 :${RESET} $(check_running && echo -e "${GREEN}● 运行中${RESET}" || echo -e "${RED}○ 未运行${RESET}")"
     echo -e "  ${GRAY}核心版本 :${RESET} $( [[ "$ver_str" == "未安装" ]] && echo -e "${YELLOW}${ver_str}${RESET}" || echo -e "${CYAN}${ver_str}${RESET}" )"
     echo -e "  ${GRAY}防护状态 :${RESET} $( [[ "$fw_status" == "none" ]] && echo -e "${GREEN}● 未启用 (默认全放行)${RESET}" || echo -e "${YELLOW}● ${fw_status} (运行中)${RESET}" )"
+    echo -e "  ${GRAY}节点地址 :${RESET} ${addr_display}"
+    if [[ -n "$STARTUP_SYNC_MSG" ]]; then
+        echo -e "  ${GREEN}✔ ${STARTUP_SYNC_MSG}${RESET}"
+        STARTUP_SYNC_MSG=""
+    fi
     echo -e "${LINE_LIGHT}"
     echo -e "  ${CYAN}1.${RESET} ${WHITE}全新安装部署${RESET}  ${GRAY}— 随机分配 >20300 端口并自动放行${RESET}"
     echo -e "  ${CYAN}2.${RESET} ${WHITE}修复系统环境${RESET}  ${GRAY}— 保留原有节点配置并同步防火墙${RESET}"
-    echo -e "  ${CYAN}3.${RESET} ${WHITE}节点服务管理${RESET}  ${GRAY}— 更新 / 卸载 / 改端口 / 改SNI / 改名${RESET}"
-    echo -e "  ${CYAN}4.${RESET} ${WHITE}查看节点链接${RESET}  ${GRAY}— 输出 SS2022 / Reality / AnyTLS 订阅${RESET}"
+    echo -e "  ${CYAN}3.${RESET} ${WHITE}节点服务管理${RESET}  ${GRAY}— 更新 / 卸载 / 改端口 / 改SNI / 改地址${RESET}"
+    echo -e "  ${CYAN}4.${RESET} ${WHITE}查看节点链接${RESET}  ${GRAY}— 实时校准动态公网 IP 并输出订阅${RESET}"
     echo -e "  ${CYAN}5.${RESET} ${WHITE}查看实时日志${RESET}  ${GRAY}— 追踪 Shoes 核心运行状态与排错${RESET}"
     echo -e "${LINE_LIGHT}"
     echo -e "  ${CYAN}0.${RESET} ${WHITE}退出管理脚本${RESET}"
@@ -1124,6 +1397,15 @@ show_main_menu() {
 }
 
 require_root
+
+# 支持 systemd 定时器后台静默调用: shoes-ip-sync --sync-ip
+if [[ "$1" == "--sync-ip" ]]; then
+    sync_dynamic_ip "cron"
+    exit 0
+fi
+
+# 启动面板时自动校准一次动态公网 IP
+sync_dynamic_ip "startup"
 
 while true; do
     show_main_menu
@@ -1140,11 +1422,12 @@ while true; do
             service_menu 
             ;;
         4) 
-            echo -e "\n${CYAN}--- 当前节点配置链接 ---${RESET}"
-            if [[ -f "${SHOES_LINK_FILE}" ]]; then
+            if sync_dynamic_ip "verbose" && [[ -f "${SHOES_LINK_FILE}" ]]; then
+                echo -e "\n${LINE_HEAVY}"
+                echo -e "  ${CYAN}当前节点配置链接${RESET} ${GRAY}(文件: ${SHOES_LINK_FILE})${RESET}"
+                echo -e "${LINE_HEAVY}"
                 cat "${SHOES_LINK_FILE}"
-            else
-                echo -e "${YELLOW}配置文件不存在，请先执行安装步骤。${RESET}"
+                echo -e "${LINE_LIGHT}"
             fi
             echo "" && read -n 1 -s -r -p "按任意键继续..." 
             ;;
