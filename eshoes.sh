@@ -9,7 +9,11 @@ BLUE='\033[1;34m'
 MAGENTA='\033[1;35m'
 CYAN='\033[1;36m'
 WHITE='\033[1;37m'
+GRAY='\033[0;90m'
 RESET='\033[0m'
+
+LINE_HEAVY="${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+LINE_LIGHT="${GRAY}──────────────────────────────────────────────────────────${RESET}"
 
 # ================== 常量定义 ==================
 SHOES_BIN="/usr/local/bin/shoes"
@@ -35,7 +39,9 @@ check_running() { systemctl is-active --quiet shoes; }
 
 get_local_version() {
     if [[ -x "$SHOES_BIN" ]]; then
-        "$SHOES_BIN" --version 2>/dev/null | awk '{print $2}' || echo "未知"
+        local ver
+        ver=$("$SHOES_BIN" --version 2>/dev/null | awk 'NR==1 {sub(/^v/, "", $2); print $2}')
+        [[ -n "$ver" ]] && echo "v${ver}" || echo "未知"
     else
         echo "未安装"
     fi
@@ -476,7 +482,7 @@ download_shoes_smart() {
         mv shoes "${SHOES_BIN}"
         chmod +x "${SHOES_BIN}"
         if ${SHOES_BIN} --version >/dev/null 2>&1; then
-            echo -e "${GREEN}GNU 版本运行正常！版本: $(${SHOES_BIN} --version)${RESET}"
+            echo -e "${GREEN}GNU 版本运行正常！版本: $(get_local_version)${RESET}"
             return
         fi
     fi
@@ -489,7 +495,7 @@ download_shoes_smart() {
         mv shoes "${SHOES_BIN}"
         chmod +x "${SHOES_BIN}"
         if ${SHOES_BIN} --version >/dev/null 2>&1; then
-            echo -e "${GREEN}MUSL 版本运行正常！版本: $(${SHOES_BIN} --version)${RESET}"
+            echo -e "${GREEN}MUSL 版本运行正常！版本: $(get_local_version)${RESET}"
             return
         fi
     fi
@@ -502,7 +508,9 @@ download_shoes_smart() {
 install_shoes() {
     local install_mode="$1"
     clear
-    echo -e "${CYAN}============= 开始部署 Shoes 代理节点 =============${RESET}"
+    echo -e "${LINE_HEAVY}"
+    echo -e "  ${CYAN}开始部署 E-Shoes 代理节点${RESET}"
+    echo -e "${LINE_HEAVY}"
     
     sync_system_time
     download_shoes_smart "normal"
@@ -670,9 +678,9 @@ EOF
         echo -e "  - ${CYAN}VLESS 端口:${RESET}   ${VLESS_PORT} (仅 IPv4)"
         echo -e "  - ${CYAN}AnyTLS 端口:${RESET}  ${ANYTLS_PORT} (仅 IPv4)"
         
-        echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
+        echo -e "${LINE_LIGHT}"
         cat "${SHOES_LINK_FILE}"
-        echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
+        echo -e "${LINE_LIGHT}"
     else
         echo -e "${RED}服务启动失败！以下为调试信息：${RESET}"
         ${SHOES_BIN} "${SHOES_CONF_FILE}"
@@ -731,18 +739,21 @@ change_ports_menu() {
         clear
         local fw_status
         fw_status=$(detect_firewall)
-        echo -e "${MAGENTA}=========================================================${RESET}"
-        echo -e "${CYAN}               修改协议端口 (限制 > 20300)               ${RESET}"
-        echo -e "${MAGENTA}=========================================================${RESET}"
-        echo -e "  ${BLUE}防火墙状态:${RESET}   $( [[ "$fw_status" == "none" ]] && echo -e "${GREEN}未启用/全放行${RESET}" || echo -e "${YELLOW}${fw_status} (将自动同步放行新端口)${RESET}" )"
-        echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
-        echo -e "  1. 修改 ${GREEN}SS-2022${RESET} 端口       (当前: ${YELLOW}${SS_PORT}${RESET})"
-        echo -e "  2. 修改 ${GREEN}VLESS-Reality${RESET} 端口 (当前: ${YELLOW}${VLESS_PORT}${RESET})"
-        echo -e "  3. 修改 ${GREEN}AnyTLS${RESET} 端口        (当前: ${YELLOW}${ANYTLS_PORT}${RESET})"
-        echo -e "  4. 一键随机更换所有协议端口 (${CYAN}20301-60000${RESET})"
-        echo -e "  0. 返回上级菜单"
-        echo -e "${MAGENTA}=========================================================${RESET}"
-        read -p "  请选择要修改的选项 [0-4]: " p_choice
+        echo -e "${LINE_HEAVY}"
+        echo -e "  ${CYAN}修改协议端口${RESET}  ${GRAY}(安全范围 ${PORT_MIN}-${PORT_MAX})${RESET}"
+        echo -e "${LINE_HEAVY}"
+        echo -e "  ${GRAY}防护状态 :${RESET} $( [[ "$fw_status" == "none" ]] && echo -e "${GREEN}● 未启用 (默认全放行)${RESET}" || echo -e "${YELLOW}● ${fw_status}${RESET} ${GRAY}(自动同步放行新端口)${RESET}" )"
+        echo -e "  ${GRAY}当前端口 :${RESET} ${WHITE}SS${RESET} ${CYAN}${SS_PORT}${RESET}  ${GRAY}|${RESET}  ${WHITE}VLESS${RESET} ${CYAN}${VLESS_PORT}${RESET}  ${GRAY}|${RESET}  ${WHITE}AnyTLS${RESET} ${CYAN}${ANYTLS_PORT}${RESET}"
+        echo -e "${LINE_LIGHT}"
+        echo -e "  ${CYAN}1.${RESET} ${WHITE}修改 SS-2022 端口${RESET}        ${GRAY}(当前: ${SS_PORT})${RESET}"
+        echo -e "  ${CYAN}2.${RESET} ${WHITE}修改 VLESS-Reality 端口${RESET}  ${GRAY}(当前: ${VLESS_PORT})${RESET}"
+        echo -e "  ${CYAN}3.${RESET} ${WHITE}修改 AnyTLS 端口${RESET}         ${GRAY}(当前: ${ANYTLS_PORT})${RESET}"
+        echo -e "  ${CYAN}4.${RESET} ${WHITE}随机重置全部协议端口${RESET}     ${GRAY}(自动避开占用端口)${RESET}"
+        echo -e "${LINE_LIGHT}"
+        echo -e "  ${CYAN}0.${RESET} ${WHITE}返回上级菜单${RESET}"
+        echo -e "${LINE_HEAVY}"
+        echo -ne "  ${WHITE}请选择操作 [0-4]: ${RESET}"
+        read -r p_choice
 
         local old_ss="$SS_PORT"
         local old_vless="$VLESS_PORT"
@@ -796,9 +807,9 @@ change_ports_menu() {
             echo -e "  - ${CYAN}SS-2022 端口:${RESET} ${SS_PORT}"
             echo -e "  - ${CYAN}VLESS 端口:${RESET}   ${VLESS_PORT}"
             echo -e "  - ${CYAN}AnyTLS 端口:${RESET}  ${ANYTLS_PORT}"
-            echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
+            echo -e "${LINE_LIGHT}"
             cat "${SHOES_LINK_FILE}"
-            echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
+            echo -e "${LINE_LIGHT}"
         else
             echo -e "${RED}服务重启失败，请检查端口冲突或系统日志！${RESET}"
         fi
@@ -818,25 +829,26 @@ change_sni_menu() {
 
     while true; do
         clear
-        echo -e "${MAGENTA}=========================================================${RESET}"
-        echo -e "${CYAN}               修改 Reality / AnyTLS 伪装域名            ${RESET}"
-        echo -e "${MAGENTA}=========================================================${RESET}"
-        echo -e "  ${BLUE}当前 VLESS-Reality SNI:${RESET} ${GREEN}${SNI}${RESET}"
-        echo -e "  ${BLUE}当前 AnyTLS 证书域名:${RESET}    ${GREEN}${ANYTLS_SNI}${RESET}"
-        echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
-        echo -e "  ${YELLOW}推荐 Reality 预设域名 (TLS 1.3 + H2 高信誉目标):${RESET}"
-        echo "  1. www.apple.com           (Apple 全球静态节点，通用稳定)"
-        echo "  2. dl.google.com           (Google 下载源，欧美/亚太推荐)"
-        echo "  3. www.microsoft.com       (Microsoft 官网，全球双栈优选)"
-        echo "  4. www.amd.com             (AMD 官网，高频 CDN 节点)"
-        echo "  5. aws.amazon.com          (AWS 官网，AWS/欧美机房优选)"
-        echo "  6. www.lovelive-anime.jp   (日本二次元站点，日本机房优选)"
-        echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
-        echo -e "  7. ${CYAN}手动输入自定义 Reality 伪装域名 (SNI)${RESET}"
-        echo -e "  8. ${CYAN}修改 AnyTLS 自签证书域名 (并自动重签证书)${RESET}"
-        echo "  0. 返回上级菜单"
-        echo -e "${MAGENTA}=========================================================${RESET}"
-        read -p "  请选择操作选项 [0-8]: " sni_choice
+        echo -e "${LINE_HEAVY}"
+        echo -e "  ${CYAN}修改 Reality / AnyTLS 伪装域名${RESET}"
+        echo -e "${LINE_HEAVY}"
+        echo -e "  ${GRAY}伪装域名 :${RESET} ${GREEN}${SNI}${RESET} ${GRAY}(VLESS-Reality)${RESET}"
+        echo -e "  ${GRAY}证书域名 :${RESET} ${CYAN}${ANYTLS_SNI}${RESET} ${GRAY}(AnyTLS 自签)${RESET}"
+        echo -e "${LINE_LIGHT}"
+        echo -e "  ${YELLOW}推荐预设域名 (TLS 1.3 + H2 高信誉目标):${RESET}"
+        echo -e "  ${CYAN}1.${RESET} ${WHITE}www.apple.com         ${RESET}  ${GRAY}— Apple 全球节点 (通用稳定)${RESET}"
+        echo -e "  ${CYAN}2.${RESET} ${WHITE}dl.google.com         ${RESET}  ${GRAY}— Google 下载源 (欧美/亚太)${RESET}"
+        echo -e "  ${CYAN}3.${RESET} ${WHITE}www.microsoft.com     ${RESET}  ${GRAY}— Microsoft 官网 (全球双栈)${RESET}"
+        echo -e "  ${CYAN}4.${RESET} ${WHITE}www.amd.com           ${RESET}  ${GRAY}— AMD 官网 (高频 CDN 节点)${RESET}"
+        echo -e "  ${CYAN}5.${RESET} ${WHITE}aws.amazon.com        ${RESET}  ${GRAY}— AWS 官网 (AWS/欧美优选)${RESET}"
+        echo -e "  ${CYAN}6.${RESET} ${WHITE}www.lovelive-anime.jp ${RESET}  ${GRAY}— 日本二次元站 (日本机房优选)${RESET}"
+        echo -e "${LINE_LIGHT}"
+        echo -e "  ${CYAN}7.${RESET} ${WHITE}自定义 Reality 伪装域名${RESET}  ${GRAY}— 手动输入目标 SNI 并检测连通性${RESET}"
+        echo -e "  ${CYAN}8.${RESET} ${WHITE}修改 AnyTLS 证书域名   ${RESET}  ${GRAY}— 更换域名并自动重签 TLS 证书${RESET}"
+        echo -e "  ${CYAN}0.${RESET} ${WHITE}返回上级菜单${RESET}"
+        echo -e "${LINE_HEAVY}"
+        echo -ne "  ${WHITE}请选择操作 [0-8]: ${RESET}"
+        read -r sni_choice
 
         local new_sni=""
         local need_re_cert=0
@@ -916,9 +928,9 @@ change_sni_menu() {
             echo -e "${GREEN}伪装域名修改成功并已生效！${RESET}"
             echo -e "  - ${CYAN}当前 Reality SNI:${RESET} ${SNI}"
             echo -e "  - ${CYAN}当前 AnyTLS SNI:${RESET}  ${ANYTLS_SNI}"
-            echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
+            echo -e "${LINE_LIGHT}"
             cat "${SHOES_LINK_FILE}"
-            echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
+            echo -e "${LINE_LIGHT}"
         else
             echo -e "${RED}服务重启失败，请检查配置或系统日志！${RESET}"
         fi
@@ -937,15 +949,16 @@ change_hostname_menu() {
     [[ -z "$ANYTLS_SNI" ]] && ANYTLS_SNI="cdn.cloudflare.net"
 
     clear
-    echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}               修改节点名称前缀 (HOST_NAME)              ${RESET}"
-    echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "  ${BLUE}当前节点名称前缀:${RESET} ${GREEN}${HOST_NAME}${RESET}"
-    echo -e "  ${BLUE}生成后的节点示例:${RESET} ${YELLOW}${HOST_NAME}-SS / ${HOST_NAME}-SS-V6 / ${HOST_NAME}-Reality${RESET}"
-    echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
-    echo -e "  提示：输入 ${CYAN}0${RESET} 可恢复为系统默认主机名 ($(hostname))，直接回车取消修改。"
+    echo -e "${LINE_HEAVY}"
+    echo -e "  ${CYAN}修改节点名称前缀 (HOST_NAME)${RESET}"
+    echo -e "${LINE_HEAVY}"
+    echo -e "  ${GRAY}当前前缀 :${RESET} ${GREEN}${HOST_NAME}${RESET}"
+    echo -e "  ${GRAY}预览效果 :${RESET} ${WHITE}${HOST_NAME}-SS${RESET} ${GRAY}/${RESET} ${WHITE}${HOST_NAME}-Reality${RESET} ${GRAY}/${RESET} ${WHITE}${HOST_NAME}-AnyTLS${RESET}"
+    echo -e "${LINE_LIGHT}"
+    echo -e "  ${GRAY}提示：输入 ${CYAN}0${GRAY} 恢复系统主机名 ($(hostname))，直接回车取消修改。${RESET}"
     echo ""
-    read -p "  请输入新的节点名称前缀 (如 HK-BGP 或 🇭🇰香港): " new_name
+    echo -ne "  ${WHITE}请输入新的节点名称前缀 (如 HK-BGP 或 🇭🇰香港): ${RESET}"
+    read -r new_name
 
     new_name=$(echo "$new_name" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr -d '#?&"')
 
@@ -965,9 +978,9 @@ change_hostname_menu() {
     generate_links
 
     echo -e "${GREEN}节点订阅链接已无缝刷新（无需重启服务）：${RESET}"
-    echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
+    echo -e "${LINE_LIGHT}"
     cat "${SHOES_LINK_FILE}"
-    echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
+    echo -e "${LINE_LIGHT}"
 }
 
 # ================== 证书管理 ==================
@@ -1042,25 +1055,31 @@ service_menu() {
             cur_sni=$(grep '^SNI=' "${SHOES_ENV_FILE}" | awk -F'"' '{print $2}')
             cur_host=$(grep '^HOST_NAME=' "${SHOES_ENV_FILE}" | awk -F'"' '{print $2}')
         fi
-        echo -e "${MAGENTA}=========================================================${RESET}"
-        echo -e "${CYAN}                 Shoes 节点服务管理子菜单                ${RESET}"
-        echo -e "${MAGENTA}=========================================================${RESET}"
-        echo -e " ${BLUE}当前核心版本:${RESET} $(get_local_version)"
-        echo -e " ${BLUE}运行状态:${RESET}     $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
-        echo -e " ${BLUE}当前伪装SNI:${RESET}  ${YELLOW}${cur_sni}${RESET}  |  ${BLUE}节点前缀:${RESET} ${YELLOW}${cur_host}${RESET}"
-        echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
-        echo "  1. 更新 Shoes 核心 (保留配置)"
-        echo "  2. 卸载服务"
-        echo "  3. 启动服务"
-        echo "  4. 停止服务"
-        echo "  5. 重启服务"
-        echo "  6. 更新 TLS 证书 (自签证书)"
-        echo -e "  7. 修改协议端口 (${GREEN}支持单独/随机更换，自动同步防火墙${RESET})"
-        echo -e "  8. 修改伪装域名 (${CYAN}支持预设/自定义 Reality SNI 与 AnyTLS 域名${RESET})"
-        echo -e "  9. 修改节点名称前缀 (${CYAN}自定义 HOST_NAME 别名，无需重启服务${RESET})"
-        echo "  0. 返回主菜单"
-        echo -e "${MAGENTA}=========================================================${RESET}"
-        read -p "  请输入对应的数字选项: " sub_choice
+        local ver_str
+        ver_str=$(get_local_version)
+        echo -e "${LINE_HEAVY}"
+        echo -e "  ${CYAN}E-Shoes 节点与服务管理${RESET}"
+        echo -e "${LINE_HEAVY}"
+        echo -e "  ${GRAY}核心版本 :${RESET} $( [[ "$ver_str" == "未安装" ]] && echo -e "${YELLOW}${ver_str}${RESET}" || echo -e "${CYAN}${ver_str}${RESET}" )"
+        echo -e "  ${GRAY}运行状态 :${RESET} $(check_running && echo -e "${GREEN}● 运行中${RESET}" || echo -e "${RED}○ 未运行${RESET}")"
+        echo -e "  ${GRAY}伪装域名 :${RESET} ${WHITE}${cur_sni}${RESET}"
+        echo -e "  ${GRAY}节点前缀 :${RESET} ${WHITE}${cur_host}${RESET}"
+        echo -e "${LINE_LIGHT}"
+        echo -e "  ${CYAN}1.${RESET} ${WHITE}更新核心版本${RESET}  ${GRAY}— 保留现有配置升级 Shoes 核心${RESET}"
+        echo -e "  ${CYAN}2.${RESET} ${WHITE}卸载节点服务${RESET}  ${GRAY}— 彻底清理程序、配置及放行规则${RESET}"
+        echo -e "  ${CYAN}3.${RESET} ${WHITE}启动节点服务${RESET}  ${GRAY}— 启动 Shoes 系统守护进程${RESET}"
+        echo -e "  ${CYAN}4.${RESET} ${WHITE}停止节点服务${RESET}  ${GRAY}— 停止 Shoes 系统守护进程${RESET}"
+        echo -e "  ${CYAN}5.${RESET} ${WHITE}重启节点服务${RESET}  ${GRAY}— 重新加载配置并重启进程${RESET}"
+        echo -e "  ${CYAN}6.${RESET} ${WHITE}重签自签证书${RESET}  ${GRAY}— 重新生成 AnyTLS 365天证书${RESET}"
+        echo -e "${LINE_LIGHT}"
+        echo -e "  ${CYAN}7.${RESET} ${WHITE}修改协议端口${RESET}  ${GRAY}— 单独或随机换端口，自动同步防火墙${RESET}"
+        echo -e "  ${CYAN}8.${RESET} ${WHITE}修改伪装域名${RESET}  ${GRAY}— 切换预设/自定义 Reality 与 AnyTLS${RESET}"
+        echo -e "  ${CYAN}9.${RESET} ${WHITE}修改节点前缀${RESET}  ${GRAY}— 自定义节点别名 (无需重启服务)${RESET}"
+        echo -e "${LINE_LIGHT}"
+        echo -e "  ${CYAN}0.${RESET} ${WHITE}返回上级菜单${RESET}"
+        echo -e "${LINE_HEAVY}"
+        echo -ne "  ${WHITE}请选择操作 [0-9]: ${RESET}"
+        read -r sub_choice
 
         case "$sub_choice" in
             1) update_core; echo "" && read -n 1 -s -r -p "按任意键返回..." ;;
@@ -1081,24 +1100,27 @@ service_menu() {
 # ================== 主菜单 ==================
 show_main_menu() {
     clear
-    local fw_status
+    local fw_status ver_str
     fw_status=$(detect_firewall)
-    echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e "${CYAN}            E-Shoes 代理节点一键管理脚本 4.2             ${RESET}"
-    echo -e "${MAGENTA}=========================================================${RESET}"
-    echo -e " ${BLUE}服务状态:${RESET} $(check_installed && echo -e "${GREEN}已安装${RESET}" || echo -e "${YELLOW}未安装${RESET}")"
-    echo -e " ${BLUE}核心版本:${RESET} $(get_local_version)"
-    echo -e " ${BLUE}运行状态:${RESET} $(check_running && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
-    echo -e " ${BLUE}防火墙:${RESET}   $( [[ "$fw_status" == "none" ]] && echo -e "${GREEN}未启用/全放行${RESET}" || echo -e "${YELLOW}${fw_status} (运行中)${RESET}" )"
-    echo -e "${MAGENTA}---------------------------------------------------------${RESET}"
-    echo -e "  1. 全新安装/重置密钥与端口 (${RED}自动分配 > 20300，自动放行${RESET})"
-    echo -e "  2. 修复/优化系统环境 (${GREEN}保留原有节点，同步防火墙规则${RESET})"
-    echo -e "  3. 服务管理 (${CYAN}更新/卸载/修改端口/自定义SNI/修改节点名称${RESET})"
-    echo "  4. 查看节点链接配置"
-    echo "  5. 查看系统实时日志"
-    echo "  0. 退出脚本"
-    echo -e "${MAGENTA}=========================================================${RESET}"
-    read -p "  请输入对应的数字选项: " choice
+    ver_str=$(get_local_version)
+    echo -e "${LINE_HEAVY}"
+    echo -e "  ${CYAN}E-Shoes 代理节点一键管理脚本${RESET} ${GRAY}v4.2${RESET}"
+    echo -e "${LINE_HEAVY}"
+    echo -e "  ${GRAY}服务状态 :${RESET} $(check_installed && echo -e "${GREEN}● 已安装${RESET}" || echo -e "${YELLOW}○ 未安装${RESET}")"
+    echo -e "  ${GRAY}运行状态 :${RESET} $(check_running && echo -e "${GREEN}● 运行中${RESET}" || echo -e "${RED}○ 未运行${RESET}")"
+    echo -e "  ${GRAY}核心版本 :${RESET} $( [[ "$ver_str" == "未安装" ]] && echo -e "${YELLOW}${ver_str}${RESET}" || echo -e "${CYAN}${ver_str}${RESET}" )"
+    echo -e "  ${GRAY}防护状态 :${RESET} $( [[ "$fw_status" == "none" ]] && echo -e "${GREEN}● 未启用 (默认全放行)${RESET}" || echo -e "${YELLOW}● ${fw_status} (运行中)${RESET}" )"
+    echo -e "${LINE_LIGHT}"
+    echo -e "  ${CYAN}1.${RESET} ${WHITE}全新安装部署${RESET}  ${GRAY}— 随机分配 >20300 端口并自动放行${RESET}"
+    echo -e "  ${CYAN}2.${RESET} ${WHITE}修复系统环境${RESET}  ${GRAY}— 保留原有节点配置并同步防火墙${RESET}"
+    echo -e "  ${CYAN}3.${RESET} ${WHITE}节点服务管理${RESET}  ${GRAY}— 更新 / 卸载 / 改端口 / 改SNI / 改名${RESET}"
+    echo -e "  ${CYAN}4.${RESET} ${WHITE}查看节点链接${RESET}  ${GRAY}— 输出 SS2022 / Reality / AnyTLS 订阅${RESET}"
+    echo -e "  ${CYAN}5.${RESET} ${WHITE}查看实时日志${RESET}  ${GRAY}— 追踪 Shoes 核心运行状态与排错${RESET}"
+    echo -e "${LINE_LIGHT}"
+    echo -e "  ${CYAN}0.${RESET} ${WHITE}退出管理脚本${RESET}"
+    echo -e "${LINE_HEAVY}"
+    echo -ne "  ${WHITE}请选择操作 [0-5]: ${RESET}"
+    read -r choice
 }
 
 require_root
