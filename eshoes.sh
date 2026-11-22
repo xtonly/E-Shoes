@@ -40,9 +40,25 @@ CACHED_LIVE_V6=""
 PORT_MIN=20301
 PORT_MAX=60000
 
-# ================== Root 检查 ==================
+# ================== Root 与基础依赖检查 ==================
 require_root() {
     [[ $EUID -ne 0 ]] && { echo -e "${RED}错误：请使用 root 用户运行此脚本${RESET}"; exit 1; }
+}
+
+ensure_base_deps() {
+    local missing=()
+    command -v curl >/dev/null 2>&1 || missing+=("curl")
+    command -v wget >/dev/null 2>&1 || missing+=("wget")
+    command -v openssl >/dev/null 2>&1 || missing+=("openssl")
+    if (( ${#missing[@]} > 0 )); then
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -y >/dev/null 2>&1 && apt-get install -y "${missing[@]}" ca-certificates >/dev/null 2>&1
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y "${missing[@]}" ca-certificates >/dev/null 2>&1
+        elif command -v apk >/dev/null 2>&1; then
+            apk add --no-cache "${missing[@]}" ca-certificates >/dev/null 2>&1
+        fi
+    fi
 }
 
 # ================== 辅助函数 ==================
@@ -212,7 +228,6 @@ detect_firewall() {
         local nft_rules
         nft_rules=$(nft list ruleset 2>/dev/null)
         if [[ -n "$nft_rules" ]] && echo "$nft_rules" | grep -q "hook input"; then
-            # 若并非仅由 iptables-nft 自动生成的空表，或明确开启了 nftables 服务/含有 drop/reject 策略
             if systemctl is-active --quiet nftables 2>/dev/null || \
                echo "$nft_rules" | grep -qiE "policy drop|policy reject|drop|reject"; then
                 if ! command -v iptables >/dev/null 2>&1 || systemctl is-active --quiet nftables 2>/dev/null; then
@@ -362,7 +377,6 @@ sync_firewall_ports() {
 
     if [[ "$fw_type" == "none" ]]; then
         echo -e "${GREEN}未检测到启用中的拦截型防火墙 (默认策略为全放行)。${RESET}"
-        # 即使未探测到拦截规则，若系统存在 iptables 命令，也主动在 INPUT 链插入放行规则作为双保险
         if command -v iptables >/dev/null 2>&1; then
             fw_open_port "$SS_PORT" "iptables"
             fw_open_port "$VLESS_PORT" "iptables"
@@ -398,20 +412,29 @@ sync_system_time() {
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update -y >/dev/null 2>&1
         apt-get install -y chrony >/dev/null 2>&1
-        systemctl restart chronyd >/dev/null 2>&1
+        systemctl restart chronyd >/dev/null 2>&1 || systemctl restart chrony >/dev/null 2>&1
         chronyc makestep >/dev/null 2>&1
     fi
     echo -e "${GREEN}时间同步完成，当前服务器时间: $(date)${RESET}"
 }
 
-# === 智能动态公网 IP 获取 (防缓存 + 亚太/全球极速源) ===
+# === 加固版智能动态公网 IP 获取 (优先 ip.sb + UA 伪装 + 正则防脏数据 + 兼容 NAT) ===
 get_public_ipv4() {
     local ip=""
-    for url in "https://4.ipw.cn" "https://api.ipify.org" "https://ipv4.icanhazip.com" "http://checkip.amazonaws.com"; do
-        ip=$(curl -fsSL -4 --connect-timeout 2 --max-time 3 -H "Cache-Control: no-cache" "$url" 2>/dev/null | tr -d '[:space:]')
+    local urls=(
+        "https://api-ipv4.ip.sb/ip"
+        "http://ip.sb"
+        "https://4.ipw.cn"
+        "https://api.ipify.org"
+        "https://ipv4.icanhazip.com"
+        "http://checkip.amazonaws.com"
+        "http://ifconfig.me/ip"
+    )
+    for url in "${urls[@]}"; do
+        ip=$(curl -fsSL -4 -A "Mozilla/5.0" --connect-timeout 3 --max-time 5 -H "Cache-Control: no-cache" "$url" 2>/dev/null | tr -d '\r\n[:space:]')
         if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
             echo "$ip"
-            return
+            return 0
         fi
     done
     echo ""
@@ -419,13 +442,20 @@ get_public_ipv4() {
 
 get_public_ipv6() {
     # 若网卡无全局 IPv6 地址则直接跳过探测，避免单栈机器超时等待
-    ip -6 addr show scope global 2>/dev/null | grep -q "inet6" || { echo ""; return; }
+    ip -6 addr show scope global 2>/dev/null | grep -q "inet6" || { echo ""; return 0; }
     local ip=""
-    for url in "https://6.ipw.cn" "https://ipv6.icanhazip.com" "https://api6.ipify.org"; do
-        ip=$(curl -fsSL -6 --connect-timeout 2 --max-time 3 -H "Cache-Control: no-cache" "$url" 2>/dev/null | tr -d '[:space:]')
+    local urls=(
+        "https://api-ipv6.ip.sb/ip"
+        "https://6.ipw.cn"
+        "https://v6.ident.me"
+        "https://ipv6.icanhazip.com"
+        "https://api6.ipify.org"
+    )
+    for url in "${urls[@]}"; do
+        ip=$(curl -fsSL -6 -A "Mozilla/5.0" --connect-timeout 3 --max-time 4 -H "Cache-Control: no-cache" "$url" 2>/dev/null | tr -d '\r\n[:space:]')
         if [[ "$ip" == *":"* ]] && [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then
             echo "$ip"
-            return
+            return 0
         fi
     done
     echo ""
@@ -517,6 +547,8 @@ generate_links() {
 
     [[ -z "$live_v4" ]] && live_v4=$(get_public_ipv4)
     [[ -z "$live_v6" ]] && live_v6=$(get_public_ipv6)
+    CACHED_LIVE_V4="$live_v4"
+    CACHED_LIVE_V6="$live_v6"
 
     if [[ -n "$live_v4" ]]; then
         LAST_IPV4="$live_v4"
@@ -614,7 +646,14 @@ EOF
 
 sync_dynamic_ip() {
     local mode="$1" # cron | startup | verbose
+
+    # 即使尚未安装，启动面板时也预先探测并缓存本机实时公网 IP 供主界面展示
     if [[ ! -f "${SHOES_ENV_FILE}" ]]; then
+        if [[ "$mode" == "startup" ]]; then
+            CACHED_LIVE_V4=$(get_public_ipv4)
+            CACHED_LIVE_V6=$(get_public_ipv6)
+            return 0
+        fi
         [[ "$mode" == "verbose" ]] && echo -e "\n${YELLOW}配置文件不存在，请先执行安装步骤。${RESET}"
         return 1
     fi
@@ -638,9 +677,9 @@ sync_dynamic_ip() {
     old_v4="${LAST_IPV4:-$(extract_link_ipv4)}"
     old_v6="${LAST_IPV6:-$(extract_link_ipv6)}"
 
-    # 即使绑定了 DDNS 域名 (用于 IPv4 节点)，SS-2022 的 IPv6 置顶节点依然使用实时公网 IPv6，因此 IPv6 变动同样自动同步！
+    # 即使绑定了 DDNS 域名 (用于 IPv4 节点)，SS-2022 的 IPv6 置顶节点依然使用实时公网 IPv6，因此 IPv6 变动同样自动同步
     if [[ -n "$CONNECT_HOST" ]]; then
-        if [[ ! -f "${SHOES_LINK_FILE}" ]] || [[ "$live_v6" != "$old_v6" ]]; then
+        if [[ ! -f "${SHOES_LINK_FILE}" ]] || [[ "$live_v6" != "$old_v6" ]] || [[ -n "$live_v4" && "$live_v4" != "$LAST_IPV4" ]]; then
             [[ "$live_v6" != "$old_v6" ]] && v6_diff=1
             generate_links "quiet" "${live_v4:-$old_v4}" "$live_v6"
             if [[ "$v6_diff" -eq 1 ]]; then
@@ -665,7 +704,8 @@ sync_dynamic_ip() {
     [[ "$live_v4" != "$old_v4" ]] && v4_diff=1
     [[ "$live_v6" != "$old_v6" ]] && v6_diff=1
 
-    if [[ ! -f "${SHOES_LINK_FILE}" ]] || [[ "$v4_diff" -eq 1 ]] || [[ "$v6_diff" -eq 1 ]]; then
+    # 若之前链接里存的是占位符 YOUR_IPV4_HERE，强制重写
+    if [[ ! -f "${SHOES_LINK_FILE}" ]] || grep -q "YOUR_IPV4_HERE" "${SHOES_LINK_FILE}" 2>/dev/null || [[ "$v4_diff" -eq 1 ]] || [[ "$v6_diff" -eq 1 ]]; then
         need_regen=1
     fi
 
@@ -717,7 +757,7 @@ check_arch() {
 }
 
 get_latest_version() {
-    LATEST_VER=$(curl -s --connect-timeout 10 https://api.github.com/repos/cfal/shoes/releases/latest \
+    LATEST_VER=$(curl -sL -A "Mozilla/5.0" --connect-timeout 10 https://api.github.com/repos/cfal/shoes/releases/latest \
         | grep '"tag_name":' \
         | sed -E 's/.*"v?([^"]+)".*/\1/')
     [[ -z "$LATEST_VER" ]] && {
@@ -746,7 +786,7 @@ download_shoes_smart() {
     cd "${TMP_DIR}" || exit 1
 
     echo -e "${YELLOW}--> 尝试下载 GNU 版本 (v${LATEST_VER})...${RESET}"
-    wget --timeout=15 --tries=3 -O shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${GNU_FILE}"
+    wget --no-check-certificate --timeout=15 --tries=3 -O shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${GNU_FILE}"
     
     if [[ -f shoes.tar.gz ]] && tar -xzf shoes.tar.gz 2>/dev/null; then
         mv shoes "${SHOES_BIN}"
@@ -759,7 +799,7 @@ download_shoes_smart() {
 
     echo -e "${RED}GNU 版本下载失败或无法运行，自动切换 MUSL 版本...${RESET}"
     rm -f "${SHOES_BIN}" shoes.tar.gz
-    wget --timeout=15 --tries=3 -O shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${MUSL_FILE}"
+    wget --no-check-certificate --timeout=15 --tries=3 -O shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${MUSL_FILE}"
     
     if [[ -f shoes.tar.gz ]] && tar -xzf shoes.tar.gz 2>/dev/null; then
         mv shoes "${SHOES_BIN}"
@@ -1277,8 +1317,7 @@ change_connect_host_menu() {
 
         if [[ -n "$CONNECT_HOST" ]]; then
             v4_cell="${CYAN}$(shorten_middle "$CONNECT_HOST" 22)${RESET}"
-            v4_stat="${CYAN}● DDNS/固定${RESET} ${GRAY}(${live_v4:-未知})${RESET}"
-            v4_stat=$(shorten_middle "$CONNECT_HOST" 1 >/dev/null; echo "${CYAN}● 固定地址${RESET}")
+            v4_stat="${CYAN}● 固定地址${RESET}"
             [[ -n "$live_v4" ]] && v4_stat="${CYAN}● 固定${RESET} ${GRAY}(公网 ${live_v4})${RESET}"
             if (( $(str_display_width "$v4_stat") > 24 )); then
                 v4_stat="${CYAN}● DDNS / 固定地址模式${RESET}"
@@ -1450,7 +1489,7 @@ uninstall_shoes() {
     echo -e "${GREEN}Shoes 及其相关配置与防火墙规则已完全卸载。${RESET}"
 }
 
-# 渲染双栈动态地址状态表格 (供主菜单与服务管理共用)
+# 渲染双栈动态地址状态表格 (支持未安装时实时显示已探测到的公网 IP)
 render_address_table() {
     local v4_addr="未配置" v4_stat="${GRAY}— 等待安装部署${RESET}"
     local v6_addr="未配置" v6_stat="${GRAY}— 等待安装部署${RESET}"
@@ -1462,6 +1501,8 @@ render_address_table() {
         env_v6=$(grep '^LAST_IPV6=' "${SHOES_ENV_FILE}" | awk -F'"' '{print $2}')
         [[ -z "$env_v4" ]] && env_v4=$(extract_link_ipv4)
         [[ -z "$env_v6" ]] && env_v6=$(extract_link_ipv6)
+        [[ -z "$env_v4" && -n "$CACHED_LIVE_V4" ]] && env_v4="$CACHED_LIVE_V4"
+        [[ -z "$env_v6" && -n "$CACHED_LIVE_V6" ]] && env_v6="$CACHED_LIVE_V6"
 
         # IPv4 行构造
         if [[ -n "$env_conn" ]]; then
@@ -1499,6 +1540,23 @@ render_address_table() {
                 v6_addr="${GRAY}未分配 / 纯 IPv4 环境${RESET}"
                 v6_stat="${GRAY}— 未启用 IPv6 节点${RESET}"
             fi
+        fi
+    else
+        # 未安装节点时，直接展示启动时实时探测到的公网 IPv4 / IPv6
+        if [[ -n "$CACHED_LIVE_V4" ]]; then
+            v4_addr="${WHITE}${CACHED_LIVE_V4}${RESET}"
+            v4_stat="${CYAN}○ 实时公网 (待部署)${RESET}"
+        else
+            v4_addr="${YELLOW}无法获取${RESET}"
+            v4_stat="${RED}○ 公网探测超时${RESET}"
+        fi
+
+        if [[ -n "$CACHED_LIVE_V6" ]]; then
+            v6_addr="${WHITE}$(format_ipv6_short "$CACHED_LIVE_V6" 22)${RESET}"
+            v6_stat="${CYAN}○ 实时公网 (待部署)${RESET}"
+        else
+            v6_addr="${GRAY}未分配 / 纯 IPv4 环境${RESET}"
+            v6_stat="${GRAY}— 无全局 IPv6${RESET}"
         fi
     fi
 
@@ -1580,7 +1638,7 @@ show_main_menu() {
     fw_disp=$( [[ "$fw_status" == "none" ]] && echo "${GREEN}● 未启用 (全放行)${RESET}" || echo "${YELLOW}● ${fw_status} (运行中)${RESET}" )
 
     echo -e "${LINE_HEAVY}"
-    echo -e "  ${CYAN}E-Shoes 代理节点一键管理脚本${RESET} ${GRAY}v4.4${RESET}"
+    echo -e "  ${CYAN}E-Shoes 代理节点一键管理脚本${RESET} ${GRAY}v4.5${RESET}"
     echo -e "${LINE_HEAVY}"
     print_kv_2col "${GRAY}服务状态 :${RESET} ${inst_disp}" "${GRAY}运行状态 :${RESET} ${run_disp}"
     print_kv_2col "${GRAY}核心版本 :${RESET} ${ver_disp}" "${GRAY}防护状态 :${RESET} ${fw_disp}"
@@ -1598,6 +1656,7 @@ show_main_menu() {
 }
 
 require_root
+ensure_base_deps
 
 # 支持 systemd 定时器后台静默调用: shoes-ip-sync --sync-ip
 if [[ "$1" == "--sync-ip" ]]; then
