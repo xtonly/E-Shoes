@@ -1,6 +1,15 @@
 #!/bin/bash
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
+# ======================================================================
+# E-Shoes 代理节点一键管理脚本 (v4.6 — 深度适配 Shoes v0.3.8+)
+# 修复：SS-2022 128-GCM (16B) 与 256-GCM (32B) 密钥长度自适应校验
+# 强化：无损原子更新核心 (沙盒预检 --version 与 --dry-run 通过才替换，清理 licenses/ 残留)
+# 修复：订阅链接节点名称标准 URL 编码 + 国旗 Emoji 4字节终端列宽精准对齐
+# 修复：独立 98-shoes 系统调优配置，卸载时绝不误伤全局 BBR 配置 + 锁定 bindv6only=0
+# 适配：Shoes v0.3.8 TLS SNI 规范化 (剥离末尾点号与非法纯十六进制后缀)
+# ======================================================================
+
 # ================== 颜色代码与风格统一 ==================
 RED='\033[1;31m'
 GREEN='\033[1;32m'
@@ -25,8 +34,13 @@ SYSTEMD_FILE="/etc/systemd/system/shoes.service"
 IP_SYNC_BIN="/usr/local/bin/shoes-ip-sync"
 IP_SYNC_SERVICE="/etc/systemd/system/shoes-ip-sync.service"
 IP_SYNC_TIMER="/etc/systemd/system/shoes-ip-sync.timer"
+LIMITS_CONF="/etc/security/limits.d/98-shoes-limits.conf"
+SYSCTL_CONF="/etc/sysctl.d/98-shoes-tuning.conf"
 SCRIPT_SOURCE="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
 TMP_DIR="/tmp/shoesdl"
+
+# 默认 SS-2022 算法 (兼容外部 sed 替换为 2022-blake3-aes-128-gcm)
+DEFAULT_SS_METHOD="2022-blake3-aes-256-gcm"
 
 # 动态 IP 面板状态缓存变量
 SYNC_V4_CHANGED=0
@@ -50,8 +64,10 @@ ensure_base_deps() {
     command -v curl >/dev/null 2>&1 || missing+=("curl")
     command -v wget >/dev/null 2>&1 || missing+=("wget")
     command -v openssl >/dev/null 2>&1 || missing+=("openssl")
+    command -v tar >/dev/null 2>&1 || missing+=("tar")
     if (( ${#missing[@]} > 0 )); then
         if command -v apt-get >/dev/null 2>&1; then
+            export DEBIAN_FRONTEND=noninteractive
             apt-get update -y >/dev/null 2>&1 && apt-get install -y "${missing[@]}" ca-certificates >/dev/null 2>&1
         elif command -v yum >/dev/null 2>&1; then
             yum install -y "${missing[@]}" ca-certificates >/dev/null 2>&1
@@ -61,7 +77,7 @@ ensure_base_deps() {
     fi
 }
 
-# ================== 辅助函数 ==================
+# ================== 辅助与编码排版函数 ==================
 check_installed() { [[ -f "$SHOES_BIN" ]] && [[ -f "$SYSTEMD_FILE" ]]; }
 check_running() { systemctl is-active --quiet shoes; }
 
@@ -75,18 +91,110 @@ get_local_version() {
     fi
 }
 
-# 计算包含 ANSI 颜色与中英文混排字符串的终端显示宽度
-str_display_width() {
-    local s clean_sym c_chars c_bytes cjk
-    s=$(printf "%b" "$1" | sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g')
-    clean_sym=$(printf "%s" "$s" | sed 's/[●○✔→—─━│╭╮╰╯├┤┬┴┼]/X/g')
-    c_chars=${#clean_sym}
-    c_bytes=$(printf "%s" "$clean_sym" | wc -c)
-    cjk=$(( (c_bytes - c_chars) / 2 ))
-    echo $(( c_chars + cjk ))
+# 纯 Bash URI 编码 (保留安全 ASCII 字符，将中文/Emoji/空格转为 %XX，确保全客户端订阅兼容)
+urlencode() {
+    local LC_ALL=C
+    local str="$1"
+    local i c hex
+    local out=""
+    for (( i=0; i<${#str}; i++ )); do
+        c="${str:i:1}"
+        case "$c" in
+            [a-zA-Z0-9._~-]) out+="$c" ;;
+            *)
+                printf -v hex '%%%02X' "'$c"
+                out+="$hex"
+                ;;
+        esac
+    done
+    printf "%s" "$out"
 }
 
-# 按指定终端列宽填充或截断单元格
+# 根据 SS-2022 算法精准生成并校验对应字节长度的 Base64 密钥 (兼容 128-gcm=16B 与 256-gcm=32B)
+generate_ss2022_key() {
+    local cipher="$1"
+    local key_bytes=32
+    local expected_len=44
+    if [[ "$cipher" == *"128"* ]]; then
+        key_bytes=16
+        expected_len=24
+    fi
+
+    local pw=""
+    if [[ -x "${SHOES_BIN}" ]]; then
+        pw=$("${SHOES_BIN}" generate-shadowsocks-2022-password --cipher "${cipher}" 2>/dev/null | tail -n 1 | awk '{print $NF}' | tr -d '\r\n[:space:]')
+    fi
+    if [[ ${#pw} -ne $expected_len ]]; then
+        pw=$(openssl rand -base64 "$key_bytes" | tr -d '\r\n[:space:]')
+    fi
+    echo "$pw"
+}
+
+# 校验现有密钥长度是否匹配当前 SS-2022 算法
+is_valid_ss2022_key() {
+    local cipher="$1"
+    local pw="$2"
+    if [[ "$cipher" == *"128"* ]]; then
+        [[ ${#pw} -eq 24 ]]
+    else
+        [[ ${#pw} -eq 44 ]]
+    fi
+}
+
+# 计算包含 ANSI 颜色、CJK 汉字及 4 字节国旗/Emoji 的真实终端显示列宽
+str_display_width() {
+    local s clean_sym ascii_str non_ascii rem_chars rem_bytes
+    s=$(printf "%b" "$1" | sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g')
+    # 将单宽度的制表/状态符号归一为单字节 X
+    clean_sym=$(printf "%s" "$s" | sed 's/[●○✔→—─━│╭╮╰╯├┤┬┴┼]/X/g')
+
+    # 若系统存在 wc -L 且当前 locale 支持 UTF-8，优先用结合补偿算法精确计算
+    ascii_str=$(LC_ALL=C printf "%s" "$clean_sym" | tr -cd '\000-\177')
+    local ascii_len=${#ascii_str}
+    non_ascii=$(LC_ALL=C printf "%s" "$clean_sym" | tr -d '\000-\177')
+    if [[ -z "$non_ascii" ]]; then
+        echo "$ascii_len"
+        return
+    fi
+
+    # 区分 3 字节 CJK (每字符占 2 列) 与 4 字节 Emoji/区域指示符 (国旗由 2 个 4 字节 RIS 组成共占 2 列，普通 Emoji 1 个 4 字节占 2 列)
+    rem_chars=${#non_ascii}
+    rem_bytes=$(LC_ALL=C printf "%s" "$non_ascii" | wc -c)
+    # 估算 4 字节字符个数: total_bytes = 3*cjk + 4*emoji4, total_chars = cjk + emoji4 => emoji4 = rem_bytes - 3*rem_chars
+    local emoji4=$(( rem_bytes - 3 * rem_chars ))
+    (( emoji4 < 0 )) && emoji4=0
+    local cjk=$(( rem_chars - emoji4 ))
+    (( cjk < 0 )) && cjk=0
+
+    # 国旗由成对 Regional Indicator 组成，若存在偶数个 4 字节且含国旗组合则折算显示列宽
+    local wide_cols=$(( cjk * 2 + emoji4 * 2 ))
+    if command -v python3 >/dev/null 2>&1 && (( emoji4 > 0 )); then
+        local py_w
+        py_w=$(python3 - "$clean_sym" <<'PY' 2>/dev/null
+import sys, unicodedata
+s = sys.argv[1]
+w, i, n = 0, 0, len(s)
+while i < n:
+    cp = ord(s[i])
+    if 0x1F1E6 <= cp <= 0x1F1FF and i + 1 < n and 0x1F1E6 <= ord(s[i+1]) <= 0x1F1FF:
+        w += 2; i += 2; continue
+    if cp in (0x200D, 0xFE0F):
+        i += 1; continue
+    eaw = unicodedata.east_asian_width(s[i])
+    w += 2 if eaw in ('W', 'F') or cp >= 0x1F300 else 1
+    i += 1
+print(w)
+PY
+)
+        if [[ "$py_w" =~ ^[0-9]+$ ]]; then
+            echo "$py_w"
+            return
+        fi
+    fi
+    echo $(( ascii_len + wide_cols ))
+}
+
+# 按指定终端列宽填充单元格
 pad_cell() {
     local text="$1"
     local target_w="$2"
@@ -104,7 +212,7 @@ print_kv_2col() {
     echo -e "  ${left}  ${GRAY}│${RESET}  $2"
 }
 
-# 3列表格行输出 (总宽 67 列: 左缩进2 + 边框4 + 间距6 + 内容 8+23+24 = 67)
+# 3列表格行输出 (总宽 67 列)
 print_ip_table_row() {
     local c1 c2 c3
     c1=$(pad_cell "$1" 8)
@@ -118,10 +226,11 @@ shorten_middle() {
     local str="$1"
     local max_len="${2:-22}"
     [[ -z "$str" ]] && { echo ""; return; }
-    if (( ${#str} <= max_len )); then
+    if (( $(str_display_width "$str") <= max_len )); then
         echo "$str"
     else
         local half=$(( (max_len - 2) / 2 ))
+        (( half < 2 )) && half=2
         echo "${str:0:$half}..${str: -$half}"
     fi
 }
@@ -172,6 +281,23 @@ compact_old_ipv6() {
     echo "原 ..:${t:0:6}"
 }
 
+# 规范化并校验 TLS SNI 域名 (适配 Shoes v0.3.8: 去末尾点号，拒绝纯十六进制数字顶级域)
+normalize_and_validate_sni() {
+    local raw="$1"
+    local cleaned
+    cleaned=$(echo "$raw" | tr -d '[:space:]' | sed -E 's#^https?://##; s#/.*$##; s#:[0-9]+$##; s#\.*$##')
+    [[ -z "$cleaned" ]] && return 1
+    # 必须包含点号且符合标准域名字符
+    [[ "$cleaned" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z0-9-]+$ ]] || return 1
+    # 拒绝纯数字或 0x 十六进制结尾的顶级标签 (v0.3.8 强制拒绝)
+    local final_label="${cleaned##*.}"
+    if [[ "$final_label" =~ ^(0[xX][0-9a-fA-F]+|[0-9]+)$ ]]; then
+        return 1
+    fi
+    echo "$cleaned"
+    return 0
+}
+
 # 检测端口是否被系统占用
 is_port_used() {
     local port="$1"
@@ -205,7 +331,6 @@ pick_vless_port() {
 
 # ================== 增强型智能防火墙探测与自动放行模块 ==================
 detect_firewall() {
-    # 1. 检测 UFW (兼容中英文输出及配置文件直接读取)
     if command -v ufw >/dev/null 2>&1; then
         if LANG=C ufw status 2>/dev/null | grep -qiE "Status:\s*active" || \
            ufw status 2>/dev/null | grep -qE "激活|active" || \
@@ -215,7 +340,6 @@ detect_firewall() {
         fi
     fi
 
-    # 2. 检测 Firewalld (兼容 systemd 与 firewall-cmd 状态码)
     if command -v firewall-cmd >/dev/null 2>&1; then
         if systemctl is-active --quiet firewalld 2>/dev/null || firewall-cmd --state >/dev/null 2>&1; then
             echo "firewalld"
@@ -223,7 +347,6 @@ detect_firewall() {
         fi
     fi
 
-    # 3. 检测 nftables (兼容未启用 systemd 服务但内核已加载 input 钩子规则的情况)
     if command -v nft >/dev/null 2>&1; then
         local nft_rules
         nft_rules=$(nft list ruleset 2>/dev/null)
@@ -238,7 +361,6 @@ detect_firewall() {
         fi
     fi
 
-    # 4. 检测 iptables (扫描全部链中的 DROP/REJECT 规则，兼容甲骨文云/云镜像/宝塔等自定义链)
     if command -v iptables >/dev/null 2>&1; then
         if iptables -S 2>/dev/null | grep -qE "^-P INPUT (DROP|REJECT)|-j (DROP|REJECT)|-j InstanceServices" || \
            systemctl is-active --quiet netfilter-persistent 2>/dev/null || \
@@ -249,7 +371,6 @@ detect_firewall() {
         fi
     fi
 
-    # 5. 再次兜底检测 nftables (防止上面因为安装了 iptables 而跳过纯 nft 规则)
     if command -v nft >/dev/null 2>&1; then
         if nft list ruleset 2>/dev/null | grep -q "hook input"; then
             echo "nftables"
@@ -405,20 +526,20 @@ sync_firewall_ports() {
 
 # === 强制系统时间同步 ===
 sync_system_time() {
-    echo -e "${YELLOW}--> 正在强制同步服务器时间 (SS-2022 精准时间)...${RESET}"
+    echo -e "${YELLOW}--> 正在强制同步服务器时间 (SS-2022 要求时间误差 <30 秒)...${RESET}"
     if command -v timedatectl >/dev/null 2>&1; then
         timedatectl set-ntp true >/dev/null 2>&1
     fi
-    if command -v apt-get >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1 && ! command -v chronyc >/dev/null 2>&1; then
         apt-get update -y >/dev/null 2>&1
         apt-get install -y chrony >/dev/null 2>&1
-        systemctl restart chronyd >/dev/null 2>&1 || systemctl restart chrony >/dev/null 2>&1
-        chronyc makestep >/dev/null 2>&1
     fi
+    systemctl restart chronyd >/dev/null 2>&1 || systemctl restart chrony >/dev/null 2>&1 || true
+    command -v chronyc >/dev/null 2>&1 && chronyc makestep >/dev/null 2>&1 || true
     echo -e "${GREEN}时间同步完成，当前服务器时间: $(date)${RESET}"
 }
 
-# === 加固版智能动态公网 IP 获取 (优先 ip.sb + UA 伪装 + 正则防脏数据 + 兼容 NAT) ===
+# === 加固版智能动态公网 IP 获取 ===
 get_public_ipv4() {
     local ip=""
     local urls=(
@@ -441,7 +562,6 @@ get_public_ipv4() {
 }
 
 get_public_ipv6() {
-    # 若网卡无全局 IPv6 地址则直接跳过探测，避免单栈机器超时等待
     ip -6 addr show scope global 2>/dev/null | grep -q "inet6" || { echo ""; return 0; }
     local ip=""
     local urls=(
@@ -488,13 +608,16 @@ CONNECT_HOST="${CONNECT_HOST}"
 LAST_IPV4="${LAST_IPV4}"
 LAST_IPV6="${LAST_IPV6}"
 EOF
+    chmod 600 "${SHOES_ENV_FILE}" 2>/dev/null || true
 }
 
 # ================== 配置文件写入函数 ==================
 write_shoes_configs() {
     save_env_file
 
-    if ip a | grep -qw inet6; then
+    # 严谨检测内核 IPv6 协议栈是否启用，并强制确保双栈套接字同时监听 IPv4+IPv6 (bindv6only=0)
+    if [[ -f /proc/net/if_inet6 ]] && [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" != "1" ]]; then
+        sysctl -w net.ipv6.bindv6only=0 >/dev/null 2>&1 || true
         BIND_ADDR="[::]"
     else
         BIND_ADDR="0.0.0.0"
@@ -538,7 +661,7 @@ write_shoes_configs() {
 EOF
 }
 
-# ================== 节点链接生成函数 (支持最新动态 IP 与自定义 DDNS) ==================
+# ================== 节点链接生成函数 (支持 URL 编码、动态 IP 与 DDNS) ==================
 generate_links() {
     local quiet_mode="$1"
     local live_v4="$2"
@@ -575,17 +698,24 @@ generate_links() {
 
     SS_LINK_BASE=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0 | tr -d '\n')
 
+    # 对节点备注名称做标准 URL 编码，确保包含 Emoji/中文/空格时在所有订阅转换器与客户端中不丢字
+    local tag_ss tag_ss_v6 tag_reality tag_anytls
+    tag_ss=$(urlencode "${HOST_NAME}-SS")
+    tag_ss_v6=$(urlencode "${HOST_NAME}-SS-V6")
+    tag_reality=$(urlencode "${HOST_NAME}-Reality")
+    tag_anytls=$(urlencode "${HOST_NAME}-AnyTLS")
+
     # 1. 置顶输出 Shadowsocks-2022 (支持 IPv4/DDNS & IPv6)
     cat > "${SHOES_LINK_FILE}" <<EOF
-# ==================== [置顶] Shadowsocks-2022 ====================
-# SS2022 (IPv4)
-ss://${SS_LINK_BASE}@${target_host}:${SS_PORT}#${HOST_NAME}-SS
+# ==================== [置顶] Shadowsocks-2022 (${SS_METHOD}) ====================
+# SS2022 (IPv4) — ${HOST_NAME}-SS
+ss://${SS_LINK_BASE}@${target_host}:${SS_PORT}#${tag_ss}
 EOF
 
     if [[ -n "$LAST_IPV6" ]]; then
         cat >> "${SHOES_LINK_FILE}" <<EOF
-# SS2022 (IPv6)
-ss://${SS_LINK_BASE}@[${LAST_IPV6}]:${SS_PORT}#${HOST_NAME}-SS-V6
+# SS2022 (IPv6) — ${HOST_NAME}-SS-V6
+ss://${SS_LINK_BASE}@[${LAST_IPV6}]:${SS_PORT}#${tag_ss_v6}
 EOF
     fi
 
@@ -593,16 +723,16 @@ EOF
     cat >> "${SHOES_LINK_FILE}" <<EOF
 
 # ==================== [分组 1] VLESS-Reality ====================
-# Reality (IPv4)
-vless://${UUID}@${target_host}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHID}&spx=%2F&type=tcp#${HOST_NAME}-Reality
+# Reality (IPv4) — ${HOST_NAME}-Reality
+vless://${UUID}@${target_host}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHID}&spx=%2F&type=tcp#${tag_reality}
 EOF
 
     # 3. 其他协议分组：AnyTLS (仅保留 IPv4/DDNS)
     cat >> "${SHOES_LINK_FILE}" <<EOF
 
 # ==================== [分组 2] AnyTLS ====================
-# AnyTLS (IPv4)
-anytls://${PUBLIC_KEY}@${target_host}:${ANYTLS_PORT}?security=tls&sni=${ANYTLS_SNI}&allowInsecure=1&insecure=1&type=tcp#${HOST_NAME}-AnyTLS
+# AnyTLS (IPv4) — ${HOST_NAME}-AnyTLS
+anytls://${PUBLIC_KEY}@${target_host}:${ANYTLS_PORT}?security=tls&sni=${ANYTLS_SNI}&allowInsecure=1&insecure=1&type=tcp#${tag_anytls}
 EOF
 }
 
@@ -647,7 +777,6 @@ EOF
 sync_dynamic_ip() {
     local mode="$1" # cron | startup | verbose
 
-    # 即使尚未安装，启动面板时也预先探测并缓存本机实时公网 IP 供主界面展示
     if [[ ! -f "${SHOES_ENV_FILE}" ]]; then
         if [[ "$mode" == "startup" ]]; then
             CACHED_LIVE_V4=$(get_public_ipv4)
@@ -661,7 +790,6 @@ sync_dynamic_ip() {
     source "${SHOES_ENV_FILE}"
     [[ -z "$ANYTLS_SNI" ]] && ANYTLS_SNI="cdn.cloudflare.net"
 
-    # 若旧版尚未配置后台同步器，平滑自动补齐
     if [[ "$mode" != "cron" ]] && check_installed && [[ ! -f "${IP_SYNC_TIMER}" ]]; then
         setup_ip_sync_timer "quiet"
     fi
@@ -677,7 +805,6 @@ sync_dynamic_ip() {
     old_v4="${LAST_IPV4:-$(extract_link_ipv4)}"
     old_v6="${LAST_IPV6:-$(extract_link_ipv6)}"
 
-    # 即使绑定了 DDNS 域名 (用于 IPv4 节点)，SS-2022 的 IPv6 置顶节点依然使用实时公网 IPv6，因此 IPv6 变动同样自动同步
     if [[ -n "$CONNECT_HOST" ]]; then
         if [[ ! -f "${SHOES_LINK_FILE}" ]] || [[ "$live_v6" != "$old_v6" ]] || [[ -n "$live_v4" && "$live_v4" != "$LAST_IPV4" ]]; then
             [[ "$live_v6" != "$old_v6" ]] && v6_diff=1
@@ -695,7 +822,6 @@ sync_dynamic_ip() {
         return 0
     fi
 
-    # 网络瞬断无法探测公网 IPv4 且无有效 IPv6 变更时跳过重写，保护现有配置
     if [[ -z "$live_v4" ]]; then
         [[ "$mode" == "verbose" ]] && echo -e "${YELLOW}--> 暂时无法探测外部公网 IPv4，当前保留上次缓存节点信息。${RESET}"
         return 0
@@ -704,7 +830,6 @@ sync_dynamic_ip() {
     [[ "$live_v4" != "$old_v4" ]] && v4_diff=1
     [[ "$live_v6" != "$old_v6" ]] && v6_diff=1
 
-    # 若之前链接里存的是占位符 YOUR_IPV4_HERE，强制重写
     if [[ ! -f "${SHOES_LINK_FILE}" ]] || grep -q "YOUR_IPV4_HERE" "${SHOES_LINK_FILE}" 2>/dev/null || [[ "$v4_diff" -eq 1 ]] || [[ "$v6_diff" -eq 1 ]]; then
         need_regen=1
     fi
@@ -723,7 +848,7 @@ sync_dynamic_ip() {
         if [[ "$mode" == "verbose" ]]; then
             [[ "$v4_diff" -eq 1 ]] && echo -e "${GREEN}--> 检测到动态 IPv4 已变更: ${YELLOW}${old_v4:-未知}${RESET} -> ${CYAN}${live_v4}${RESET}"
             [[ "$v6_diff" -eq 1 ]] && echo -e "${GREEN}--> 检测到动态 IPv6 已变更: ${YELLOW}${old_v6:-无}${RESET} -> ${CYAN}${live_v6:-无}${RESET}"
-            echo -e "${GREEN}--> 节点订阅链接已自动更新为最新公网 IP！${RESET}"
+            echo -e "${GREEN}--> 节点订阅链接已自动更新为最新公网 IP (Shoes 0.3.8+ 已自动重置内部 Worker)！${RESET}"
         fi
     else
         if [[ -z "$LAST_IPV4" ]] || [[ "$LAST_IPV6" != "$live_v6" ]]; then
@@ -738,7 +863,7 @@ sync_dynamic_ip() {
     return 0
 }
 
-# ================== 架构检测与下载 ==================
+# ================== 架构检测与无损沙盒原子下载 (适配 v0.3.8 打包结构) ==================
 check_arch() {
     case "$(uname -m)" in
         x86_64)
@@ -750,71 +875,105 @@ check_arch() {
             MUSL_FILE="shoes-aarch64-unknown-linux-musl.tar.gz"
             ;;
         *)
-            echo -e "${RED}不支持的 CPU 架构！${RESET}"
-            exit 1
+            echo -e "${RED}不支持的 CPU 架构: $(uname -m)！${RESET}"
+            return 1
             ;;
     esac
+    return 0
 }
 
 get_latest_version() {
-    LATEST_VER=$(curl -sL -A "Mozilla/5.0" --connect-timeout 10 https://api.github.com/repos/cfal/shoes/releases/latest \
+    LATEST_VER=$(curl -sL -A "Mozilla/5.0" --connect-timeout 8 --max-time 12 https://api.github.com/repos/cfal/shoes/releases/latest \
         | grep '"tag_name":' \
         | sed -E 's/.*"v?([^"]+)".*/\1/')
-    [[ -z "$LATEST_VER" ]] && {
-        echo -e "${RED}无法获取 Shoes 最新版本，请检查网络！${RESET}"
-        exit 1
-    }
+    # 若 GitHub API 遭遇 403 限流，通过 releases/latest HTTP 302 Location 头无鉴权兜底提取版本号
+    if [[ -z "$LATEST_VER" ]]; then
+        LATEST_VER=$(curl -sIL -A "Mozilla/5.0" --connect-timeout 8 --max-time 12 -o /dev/null -w '%{url_effective}' https://github.com/cfal/shoes/releases/latest \
+            | awk -F'/tag/' '{print $2}' | sed 's/^v//' | tr -d '\r\n[:space:]')
+    fi
+    if [[ -z "$LATEST_VER" || "$LATEST_VER" == *"github.com"* ]]; then
+        echo -e "${RED}无法获取 Shoes 最新版本号，请检查服务器到 GitHub 的网络连接！${RESET}"
+        return 1
+    fi
+    return 0
 }
 
+# 沙盒无损下载：绝不提前删除现网运行中的二进制，校验通过后再原子替换，并清理 v0.3.8 新增的 licenses/ 临时文件
 download_shoes_smart() {
     local force_update="$1"
 
     echo -e "${YELLOW}--> 正在准备 Shoes 核心文件...${RESET}"
-    
-    if [[ "$force_update" != "force" ]] && [[ -f "${SHOES_BIN}" ]]; then
-        chmod +x "${SHOES_BIN}"
-        if ${SHOES_BIN} --version >/dev/null 2>&1; then
+
+    if [[ "$force_update" != "force" ]] && [[ -x "${SHOES_BIN}" ]]; then
+        if "${SHOES_BIN}" --version >/dev/null 2>&1; then
             echo -e "${GREEN}检测到当前核心可用 ($(get_local_version))，跳过下载。${RESET}"
-            return
+            return 0
         fi
     fi
 
-    rm -f "${SHOES_BIN}"
-    get_latest_version
-    check_arch
+    get_latest_version || return 1
+    check_arch || return 1
+
+    local cur_ver
+    cur_ver=$(get_local_version | sed 's/^v//')
+    if [[ "$force_update" == "force" ]] && [[ "$cur_ver" == "$LATEST_VER" ]]; then
+        echo -e "${GREEN}当前核心已是最新版本 (v${LATEST_VER})，无需重复下载！${RESET}"
+        return 0
+    fi
+
+    rm -rf "${TMP_DIR}"
     mkdir -p "${TMP_DIR}"
-    cd "${TMP_DIR}" || exit 1
 
-    echo -e "${YELLOW}--> 尝试下载 GNU 版本 (v${LATEST_VER})...${RESET}"
-    wget --no-check-certificate --timeout=15 --tries=3 -O shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${GNU_FILE}"
-    
-    if [[ -f shoes.tar.gz ]] && tar -xzf shoes.tar.gz 2>/dev/null; then
-        mv shoes "${SHOES_BIN}"
-        chmod +x "${SHOES_BIN}"
-        if ${SHOES_BIN} --version >/dev/null 2>&1; then
-            echo -e "${GREEN}GNU 版本运行正常！版本: $(get_local_version)${RESET}"
-            return
+    local candidate_bin=""
+    local variant_label=""
+
+    for item in "GNU:${GNU_FILE}" "MUSL:${MUSL_FILE}"; do
+        variant_label="${item%%:*}"
+        local pkg_name="${item#*:}"
+        echo -e "${YELLOW}--> 尝试下载 ${variant_label} 版本 (v${LATEST_VER})...${RESET}"
+
+        rm -rf "${TMP_DIR:?}"/*
+        if wget --no-check-certificate --timeout=15 --tries=2 -qO "${TMP_DIR}/shoes.tar.gz" "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${pkg_name}"; then
+            if tar -xzf "${TMP_DIR}/shoes.tar.gz" -C "${TMP_DIR}" 2>/dev/null; then
+                # 精确查找可执行主文件 (自动忽略 v0.3.8 新增的 LICENSE, THIRD_PARTY_NOTICES.md 与 licenses/ 目录)
+                local found_bin
+                found_bin=$(find "${TMP_DIR}" -maxdepth 2 -type f -name "shoes" | head -n 1)
+                if [[ -n "$found_bin" ]]; then
+                    chmod +x "$found_bin"
+                    if "$found_bin" --version >/dev/null 2>&1; then
+                        candidate_bin="$found_bin"
+                        break
+                    fi
+                fi
+            fi
+        fi
+        echo -e "${YELLOW}${variant_label} 版本不可用或运行环境不匹配，正在尝试备选包...${RESET}"
+    done
+
+    if [[ -z "$candidate_bin" ]]; then
+        rm -rf "${TMP_DIR}"
+        echo -e "${RED}严重错误：新版本下载或运行校验失败！已保留原有核心不受影响。${RESET}"
+        return 1
+    fi
+
+    # 若当前已有配置文件，升级前用新核心预跑 --dry-run，防止未来新版本配置不兼容导致服务挂死
+    if [[ -f "${SHOES_CONF_FILE}" ]]; then
+        if ! "$candidate_bin" --dry-run "${SHOES_CONF_FILE}" >/dev/null 2>&1; then
+            echo -e "${RED}警告：新核心 (v${LATEST_VER}) 对现有 config.yaml 预检 (--dry-run) 未通过！已中止替换以保护现网节点：${RESET}"
+            "$candidate_bin" --dry-run "${SHOES_CONF_FILE}" || true
+            rm -rf "${TMP_DIR}"
+            return 1
         fi
     fi
 
-    echo -e "${RED}GNU 版本下载失败或无法运行，自动切换 MUSL 版本...${RESET}"
-    rm -f "${SHOES_BIN}" shoes.tar.gz
-    wget --no-check-certificate --timeout=15 --tries=3 -O shoes.tar.gz "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${MUSL_FILE}"
-    
-    if [[ -f shoes.tar.gz ]] && tar -xzf shoes.tar.gz 2>/dev/null; then
-        mv shoes "${SHOES_BIN}"
-        chmod +x "${SHOES_BIN}"
-        if ${SHOES_BIN} --version >/dev/null 2>&1; then
-            echo -e "${GREEN}MUSL 版本运行正常！版本: $(get_local_version)${RESET}"
-            return
-        fi
-    fi
-    
-    echo -e "${RED}严重错误：所有版本下载均失败或无法运行！请检查服务器网络与 GitHub 的连接状况。${RESET}"
-    exit 1
+    # 原子替换至目标路径 (避免 Text file busy 报错，无需提前 rm 破坏失败回退)
+    install -m 755 "$candidate_bin" "${SHOES_BIN}.new" && mv -f "${SHOES_BIN}.new" "${SHOES_BIN}"
+    rm -rf "${TMP_DIR}"
+    echo -e "${GREEN}${variant_label} 版本部署并通过校验！当前核心版本: $(get_local_version)${RESET}"
+    return 0
 }
 
-# ================== 核心安装逻辑 (全自动流程不变) ==================
+# ================== 核心安装逻辑 ==================
 install_shoes() {
     local install_mode="$1"
     clear
@@ -823,7 +982,10 @@ install_shoes() {
     echo -e "${LINE_HEAVY}"
     
     sync_system_time
-    download_shoes_smart "normal"
+    if ! download_shoes_smart "normal"; then
+        echo -e "${RED}核心准备失败，已中止安装流程。${RESET}"
+        return 1
+    fi
     mkdir -p "${SHOES_CONF_DIR}"
 
     local OLD_SS_PORT=""
@@ -836,13 +998,20 @@ install_shoes() {
     fi
 
     if [[ "$install_mode" == "keep" ]] && [[ -f "${SHOES_ENV_FILE}" ]] && [[ -f "${SHOES_CONF_FILE}" ]]; then
-        echo -e "${GREEN}--> 正在读取现有配置文件，检查端口与节点信息...${RESET}"
+        echo -e "${GREEN}--> 正在读取现有配置文件，检查端口、算法与节点信息...${RESET}"
         source "${SHOES_ENV_FILE}"
         
         if [[ -z "$PRIVATE_KEY" ]]; then
             PRIVATE_KEY=$(grep 'private_key:' "${SHOES_CONF_FILE}" | head -n 1 | awk -F'"' '{print $2}')
         fi
         [[ -z "$HOST_NAME" ]] && HOST_NAME=$(hostname)
+        [[ -z "$SS_METHOD" ]] && SS_METHOD="${DEFAULT_SS_METHOD}"
+
+        # 自动修复旧版因 128-gcm / 256-gcm 混用导致的密钥长度不匹配问题
+        if ! is_valid_ss2022_key "$SS_METHOD" "$SS_PASSWORD"; then
+            SS_PASSWORD=$(generate_ss2022_key "$SS_METHOD")
+            echo -e "${YELLOW}--> 检测到原 SS-2022 密钥长度与 ${SS_METHOD} 不匹配，已自动重新生成合规密钥！${RESET}"
+        fi
         
         if [[ -z "$VLESS_PORT" ]] || [[ "$VLESS_PORT" -lt "$PORT_MIN" ]]; then
             VLESS_PORT=$(pick_vless_port)
@@ -863,12 +1032,14 @@ install_shoes() {
             echo -e "${YELLOW}--> 检测到原 AnyTLS 端口 <= 20300，已自动迁移至: ${ANYTLS_PORT}${RESET}"
         fi
 
-        if [[ -z "$SNI" ]] || [[ "$SNI" == "icloud.com" ]]; then
+        SNI=$(normalize_and_validate_sni "$SNI" || echo "www.apple.com")
+        if [[ "$SNI" == "icloud.com" ]]; then
             SNI="www.apple.com"
             echo -e "${YELLOW}--> 已自动将旧的 Reality SNI (icloud.com) 升级为 ${SNI}${RESET}"
         fi
         
         SKIP_CERT=0
+        ANYTLS_SNI=$(normalize_and_validate_sni "$ANYTLS_SNI" || echo "")
         if [[ -z "$ANYTLS_SNI" ]] || [[ "$ANYTLS_SNI" == "icloud.com" ]] || [[ "$ANYTLS_SNI" == "$SNI" ]]; then
             ANYTLS_SNI="cdn.cloudflare.net"
             echo -e "${YELLOW}--> 已分离 AnyTLS 自签证书域名为 ${ANYTLS_SNI}，即将重新生成证书...${RESET}"
@@ -905,16 +1076,13 @@ install_shoes() {
         done
 
         UUID=$(cat /proc/sys/kernel/random/uuid)
-        KEYPAIR=$(${SHOES_BIN} generate-reality-keypair)
+        KEYPAIR=$("${SHOES_BIN}" generate-reality-keypair)
         PRIVATE_KEY=$(echo "$KEYPAIR" | grep -i "private key" | awk '{print $NF}')
         PUBLIC_KEY=$(echo "$KEYPAIR" | grep -i "public key" | awk '{print $NF}')
         SHID=$(openssl rand -hex 8)
 
-        SS_METHOD="2022-blake3-aes-256-gcm"
-        SS_PASSWORD=$(${SHOES_BIN} generate-shadowsocks-2022-password --cipher "${SS_METHOD}" 2>/dev/null | tail -n 1 | awk '{print $NF}')
-        if [[ -z "$SS_PASSWORD" ]] || [[ ${#SS_PASSWORD} -lt 32 ]]; then
-            SS_PASSWORD=$(openssl rand -base64 32 | tr -d '\n\r')
-        fi
+        SS_METHOD="${DEFAULT_SS_METHOD}"
+        SS_PASSWORD=$(generate_ss2022_key "$SS_METHOD")
         SKIP_CERT=0
     fi
 
@@ -922,14 +1090,15 @@ install_shoes() {
         echo -e "${YELLOW}--> 正在生成包含 SAN 扩展的自签 TLS 证书 (365天标准周期)...${RESET}"
         openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
         openssl req -new -x509 -days 365 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${ANYTLS_SNI}" -addext "subjectAltName=DNS:${ANYTLS_SNI}" >/dev/null 2>&1
+        chmod 600 "${SHOES_CONF_DIR}/key.pem" 2>/dev/null || true
     fi
 
     echo -e "${YELLOW}--> 正在检测服务器网络栈环境并写入配置...${RESET}"
     write_shoes_configs
     if [[ "$BIND_ADDR" == "[::]" ]]; then
-        echo -e "${GREEN}检测到本地已开启 IPv6 协议栈，核心服务支持双栈监听 [::]${RESET}"
+        echo -e "${GREEN}检测到本地已开启 IPv6 协议栈，核心服务已启用双栈监听 [::] (IPv4+IPv6)${RESET}"
     else
-        echo -e "${YELLOW}系统底层未开启 IPv6，将仅监听 IPv4 防止核心 Panic${RESET}"
+        echo -e "${YELLOW}系统底层已禁用 IPv6，将仅监听 0.0.0.0 (IPv4) 防止核心 Panic${RESET}"
     fi
 
     sync_firewall_ports "$OLD_SS_PORT" "$OLD_VLESS_PORT" "$OLD_ANYTLS_PORT"
@@ -937,7 +1106,8 @@ install_shoes() {
     cat > "${SYSTEMD_FILE}" <<EOF
 [Unit]
 Description=Shoes Proxy Server
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -954,15 +1124,16 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
 
-    echo -e "${YELLOW}--> 正在优化系统级文件描述符与网络参数...${RESET}"
-    cat > /etc/security/limits.d/99-bbr-optimization.conf <<EOF
+    echo -e "${YELLOW}--> 正在优化系统级文件描述符与网络参数 (独立配置文件，不冲突全局 BBR)...${RESET}"
+    mkdir -p /etc/security/limits.d /etc/sysctl.d
+    cat > "${LIMITS_CONF}" <<EOF
 * soft nofile 65535
 * hard nofile 1048576
 root soft nofile 65535
 root hard nofile 1048576
 EOF
 
-    cat > /etc/sysctl.d/99-bbr-optimization.conf <<'EOF'
+    cat > "${SYSCTL_CONF}" <<'EOF'
 fs.file-max = 1048576
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -988,7 +1159,7 @@ EOF
         setup_ip_sync_timer
         
         echo -e "\n${GREEN}Shoes 部署完成！当前分配端口均在 20300 之后：${RESET}"
-        echo -e "  - ${CYAN}SS-2022 端口:${RESET} ${SS_PORT} (含 IPv4 & IPv6)"
+        echo -e "  - ${CYAN}SS-2022 端口:${RESET} ${SS_PORT} (${SS_METHOD} | IPv4 & IPv6)"
         echo -e "  - ${CYAN}VLESS 端口:${RESET}   ${VLESS_PORT} (仅 IPv4)"
         echo -e "  - ${CYAN}AnyTLS 端口:${RESET}  ${ANYTLS_PORT} (仅 IPv4)"
         
@@ -997,7 +1168,7 @@ EOF
         echo -e "${LINE_LIGHT}"
     else
         echo -e "${RED}服务启动失败！以下为调试信息：${RESET}"
-        ${SHOES_BIN} "${SHOES_CONF_FILE}"
+        "${SHOES_BIN}" --dry-run "${SHOES_CONF_FILE}"
     fi
 }
 
@@ -1131,7 +1302,7 @@ change_ports_menu() {
     done
 }
 
-# ================== 修改伪装域名 (SNI) 功能 ==================
+# ================== 修改伪装域名 (SNI) 功能 (适配 v0.3.8 证书根库与名称校验) ==================
 change_sni_menu() {
     if [[ ! -f "${SHOES_ENV_FILE}" ]] || [[ ! -f "${SHOES_CONF_FILE}" ]]; then
         echo -e "\n${RED}错误：未检测到已安装的配置文件，请先执行安装！${RESET}"
@@ -1149,7 +1320,7 @@ change_sni_menu() {
         echo -e "  ${GRAY}伪装域名 :${RESET} ${GREEN}${SNI}${RESET} ${GRAY}(VLESS-Reality)${RESET}"
         echo -e "  ${GRAY}证书域名 :${RESET} ${CYAN}${ANYTLS_SNI}${RESET} ${GRAY}(AnyTLS 自签)${RESET}"
         echo -e "${LINE_LIGHT}"
-        echo -e "  ${YELLOW}推荐预设域名 (TLS 1.3 + H2 高信誉目标):${RESET}"
+        echo -e "  ${YELLOW}推荐预设域名 (TLS 1.3 + H2 + 兼容 v0.3.8 根证书束):${RESET}"
         echo -e "  ${CYAN}1.${RESET} ${WHITE}www.apple.com         ${RESET}  ${GRAY}— Apple 全球节点 (通用稳定)${RESET}"
         echo -e "  ${CYAN}2.${RESET} ${WHITE}dl.google.com         ${RESET}  ${GRAY}— Google 下载源 (欧美/亚太)${RESET}"
         echo -e "  ${CYAN}3.${RESET} ${WHITE}www.microsoft.com     ${RESET}  ${GRAY}— Microsoft 官网 (全球双栈)${RESET}"
@@ -1157,7 +1328,7 @@ change_sni_menu() {
         echo -e "  ${CYAN}5.${RESET} ${WHITE}aws.amazon.com        ${RESET}  ${GRAY}— AWS 官网 (AWS/欧美优选)${RESET}"
         echo -e "  ${CYAN}6.${RESET} ${WHITE}www.lovelive-anime.jp ${RESET}  ${GRAY}— 日本二次元站 (日本机房优选)${RESET}"
         echo -e "${LINE_LIGHT}"
-        echo -e "  ${CYAN}7.${RESET} ${WHITE}自定义 Reality 伪装域名${RESET}  ${GRAY}— 手动输入目标 SNI 并检测连通性${RESET}"
+        echo -e "  ${CYAN}7.${RESET} ${WHITE}自定义 Reality 伪装域名${RESET}  ${GRAY}— 手动输入目标 SNI 并检测证书链${RESET}"
         echo -e "  ${CYAN}8.${RESET} ${WHITE}修改 AnyTLS 证书域名   ${RESET}  ${GRAY}— 更换域名并自动重签 TLS 证书${RESET}"
         echo -e "  ${CYAN}0.${RESET} ${WHITE}返回上级菜单${RESET}"
         echo -e "${LINE_HEAVY}"
@@ -1176,28 +1347,26 @@ change_sni_menu() {
             6) new_sni="www.lovelive-anime.jp" ;;
             7)
                 read -p "  请输入自定义 Reality SNI 域名 (如 www.sony.jp): " custom_sni
-                custom_sni=$(echo "$custom_sni" | tr -d '[:space:]' | sed -E 's#^https?://##; s#/.*$##')
-                if [[ -z "$custom_sni" ]] || ! [[ "$custom_sni" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-                    echo -e "  ${RED}错误：域名格式无效，请重新输入！${RESET}"
-                    sleep 1.5
+                if ! new_sni=$(normalize_and_validate_sni "$custom_sni"); then
+                    echo -e "  ${RED}错误：域名格式无效或含非法数字/十六进制顶级标签 (v0.3.8 限制)！${RESET}"
+                    sleep 1.8
                     continue
                 fi
-                new_sni="$custom_sni"
                 ;;
             8)
                 read -p "  请输入新的 AnyTLS 自签证书域名 [当前: ${ANYTLS_SNI}]: " custom_anytls
-                custom_anytls=$(echo "$custom_anytls" | tr -d '[:space:]' | sed -E 's#^https?://##; s#/.*$##')
-                if [[ -z "$custom_anytls" ]] || ! [[ "$custom_anytls" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-                    echo -e "  ${RED}错误：域名格式无效，请重新输入！${RESET}"
-                    sleep 1.5
+                local parsed_anytls
+                if ! parsed_anytls=$(normalize_and_validate_sni "$custom_anytls"); then
+                    echo -e "  ${RED}错误：域名格式无效或含非法数字/十六进制顶级标签！${RESET}"
+                    sleep 1.8
                     continue
                 fi
-                if [[ "$custom_anytls" == "$SNI" ]]; then
+                if [[ "$parsed_anytls" == "$SNI" ]]; then
                     echo -e "  ${RED}错误：AnyTLS 证书域名不能与 Reality SNI (${SNI}) 相同，以免暴露自签特征！${RESET}"
                     sleep 2
                     continue
                 fi
-                ANYTLS_SNI="$custom_anytls"
+                ANYTLS_SNI="$parsed_anytls"
                 need_re_cert=1
                 ;;
             0)
@@ -1211,11 +1380,19 @@ change_sni_menu() {
         esac
 
         if [[ -n "$new_sni" ]]; then
-            echo -e "\n${YELLOW}--> 正在测试本机到 ${new_sni}:443 的 TLS 握手连通性...${RESET}"
-            if timeout 5 openssl s_client -connect "${new_sni}:443" -servername "${new_sni}" </dev/null 2>/dev/null | grep -q "Verify return code: 0"; then
-                echo -e "${GREEN}--> 域名 ${new_sni}:443 TLS 证书校验通过！${RESET}"
+            echo -e "\n${YELLOW}--> 正在测试本机到 ${new_sni}:443 的 TLS 1.3 握手与根证书链兼容性...${RESET}"
+            local tls_out
+            tls_out=$(timeout 5 openssl s_client -tls1_3 -connect "${new_sni}:443" -servername "${new_sni}" </dev/null 2>/dev/null)
+            if echo "$tls_out" | grep -q "Verify return code: 0"; then
+                if echo "$tls_out" | grep -qiE "DigiCert Trusted Root G4|QuoVadis Root CA|Buypass Class|Certigna Root CA"; then
+                    echo -e "${YELLOW}注意：该站点证书链包含 Shoes v0.3.8 已移除的根证书 (如 DigiCert G4 / QuoVadis / Buypass)。${RESET}"
+                    read -p "  是否仍然继续使用该域名？[y/N]: " force_ca
+                    [[ ! "$force_ca" =~ ^[yY]$ ]] && continue
+                else
+                    echo -e "${GREEN}--> 域名 ${new_sni}:443 TLS 1.3 握手与证书链校验完美通过！${RESET}"
+                fi
             else
-                echo -e "${YELLOW}警告：本机连接 ${new_sni}:443 超时或证书校验异常。${RESET}"
+                echo -e "${YELLOW}警告：本机连接 ${new_sni}:443 超时、不支持 TLS 1.3 或证书校验异常。${RESET}"
                 read -p "  是否仍然强制使用该域名？[y/N]: " force_sni
                 [[ ! "$force_sni" =~ ^[yY]$ ]] && continue
             fi
@@ -1230,6 +1407,7 @@ change_sni_menu() {
             echo -e "${YELLOW}--> 正在为 AnyTLS (${ANYTLS_SNI}) 重新生成自签 TLS 证书...${RESET}"
             openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
             openssl req -new -x509 -days 365 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${ANYTLS_SNI}" -addext "subjectAltName=DNS:${ANYTLS_SNI}" >/dev/null 2>&1
+            chmod 600 "${SHOES_CONF_DIR}/key.pem" 2>/dev/null || true
         fi
 
         echo -e "${YELLOW}--> 正在更新配置文件并重启 Shoes 服务...${RESET}"
@@ -1252,6 +1430,63 @@ change_sni_menu() {
     done
 }
 
+# ================== 切换 SS-2022 加密算法 (128-GCM / 256-GCM) ==================
+change_ss_cipher_menu() {
+    if [[ ! -f "${SHOES_ENV_FILE}" ]] || [[ ! -f "${SHOES_CONF_FILE}" ]]; then
+        echo -e "\n${RED}错误：未检测到已安装的配置文件，请先执行安装！${RESET}"
+        return
+    fi
+
+    source "${SHOES_ENV_FILE}"
+    [[ -z "$ANYTLS_SNI" ]] && ANYTLS_SNI="cdn.cloudflare.net"
+
+    clear
+    echo -e "${LINE_HEAVY}"
+    echo -e "  ${CYAN}切换 Shadowsocks-2022 加密套件${RESET}"
+    echo -e "${LINE_HEAVY}"
+    echo -e "  ${GRAY}当前算法 :${RESET} ${GREEN}${SS_METHOD}${RESET}"
+    echo -e "${LINE_LIGHT}"
+    echo -e "  ${CYAN}1.${RESET} ${WHITE}2022-blake3-aes-128-gcm${RESET}       ${GRAY}— 极速低延迟 (16字节密钥，推荐移动/家宽)${RESET}"
+    echo -e "  ${CYAN}2.${RESET} ${WHITE}2022-blake3-aes-256-gcm${RESET}       ${GRAY}— 高强加密   (32字节密钥，通用标准)${RESET}"
+    echo -e "  ${CYAN}3.${RESET} ${WHITE}2022-blake3-chacha20-poly1305${RESET} ${GRAY}— 纯软算优化 (32字节密钥，无AES指令集适用)${RESET}"
+    echo -e "${LINE_LIGHT}"
+    echo -e "  ${CYAN}0.${RESET} ${WHITE}返回上级菜单${RESET}"
+    echo -e "${LINE_HEAVY}"
+    echo -ne "  ${WHITE}请选择加密算法 [0-3]: ${RESET}"
+    read -r c_choice
+
+    local target_method=""
+    case "$c_choice" in
+        1) target_method="2022-blake3-aes-128-gcm" ;;
+        2) target_method="2022-blake3-aes-256-gcm" ;;
+        3) target_method="2022-blake3-chacha20-poly1305" ;;
+        0) return ;;
+        *) echo -e "${RED}无效选项！${RESET}"; sleep 1; return ;;
+    esac
+
+    if [[ "$target_method" == "$SS_METHOD" ]] && is_valid_ss2022_key "$SS_METHOD" "$SS_PASSWORD"; then
+        echo -e "\n${YELLOW}当前已是 ${target_method} 且密钥正常，无需变更。${RESET}"
+        return
+    fi
+
+    SS_METHOD="$target_method"
+    SS_PASSWORD=$(generate_ss2022_key "$SS_METHOD")
+    echo -e "\n${YELLOW}--> 已切换算法为 ${SS_METHOD} 并同步生成对应长度密钥，正在重启服务...${RESET}"
+    write_shoes_configs
+    systemctl restart shoes
+    sleep 2
+
+    if check_running; then
+        generate_links
+        echo -e "${GREEN}SS-2022 加密算法更新成功！最新节点链接：${RESET}"
+        echo -e "${LINE_LIGHT}"
+        cat "${SHOES_LINK_FILE}"
+        echo -e "${LINE_LIGHT}"
+    else
+        echo -e "${RED}服务重启失败，请检查日志！${RESET}"
+    fi
+}
+
 # ================== 修改节点名称前缀 (HOST_NAME) 功能 ==================
 change_hostname_menu() {
     if [[ ! -f "${SHOES_ENV_FILE}" ]] || [[ ! -f "${SHOES_CONF_FILE}" ]]; then
@@ -1269,9 +1504,9 @@ change_hostname_menu() {
     echo -e "  ${GRAY}当前前缀 :${RESET} ${GREEN}${HOST_NAME}${RESET}"
     echo -e "  ${GRAY}预览效果 :${RESET} ${WHITE}${HOST_NAME}-SS${RESET} ${GRAY}/${RESET} ${WHITE}${HOST_NAME}-Reality${RESET} ${GRAY}/${RESET} ${WHITE}${HOST_NAME}-AnyTLS${RESET}"
     echo -e "${LINE_LIGHT}"
-    echo -e "  ${GRAY}提示：输入 ${CYAN}0${GRAY} 恢复系统主机名 ($(hostname))，直接回车取消修改。${RESET}"
+    echo -e "  ${GRAY}提示：输入 ${CYAN}0${GRAY} 恢复系统主机名 ($(hostname))，直接回车取消修改 (支持中文与国旗 Emoji)。${RESET}"
     echo ""
-    echo -ne "  ${WHITE}请输入新的节点名称前缀 (如 HK-BGP 或 🇭🇰香港): ${RESET}"
+    echo -ne "  ${WHITE}请输入新的节点名称前缀 (如 HK-BGP 或 IKuuu-广电1 🇭🇰): ${RESET}"
     read -r new_name
 
     new_name=$(echo "$new_name" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr -d '#?&"')
@@ -1291,7 +1526,7 @@ change_hostname_menu() {
     write_shoes_configs
     generate_links
 
-    echo -e "${GREEN}节点订阅链接已无缝刷新（无需重启服务）：${RESET}"
+    echo -e "${GREEN}节点订阅链接已无缝刷新（自动完成标准 URI 编码，无需重启服务）：${RESET}"
     echo -e "${LINE_LIGHT}"
     cat "${SHOES_LINK_FILE}"
     echo -e "${LINE_LIGHT}"
@@ -1381,7 +1616,7 @@ change_connect_host_menu() {
                 echo ""
                 echo -ne "  ${WHITE}请输入 DDNS 域名或指定连接 IP (直接回车取消): ${RESET}"
                 read -r custom_host
-                custom_host=$(echo "$custom_host" | tr -d '[:space:]' | sed -E 's#^https?://##; s#/.*$##; s#:[0-9]+$##')
+                custom_host=$(echo "$custom_host" | tr -d '[:space:]' | sed -E 's#^https?://##; s#/.*$##; s#:[0-9]+$##; s#\.*$##')
                 if [[ -z "$custom_host" ]]; then
                     echo -e "  ${YELLOW}未输入内容，已取消修改。${RESET}"
                     sleep 1
@@ -1434,11 +1669,12 @@ update_certificate() {
     source "${SHOES_ENV_FILE}"
     [[ -z "$ANYTLS_SNI" ]] && ANYTLS_SNI="cdn.cloudflare.net"
     
-    [[ -f "${SHOES_CONF_DIR}/key.pem" ]] && mv "${SHOES_CONF_DIR}/key.pem" "${SHOES_CONF_DIR}/key.pem.bak"
-    [[ -f "${SHOES_CONF_DIR}/cert.pem" ]] && mv "${SHOES_CONF_DIR}/cert.pem" "${SHOES_CONF_DIR}/cert.pem.bak"
+    [[ -f "${SHOES_CONF_DIR}/key.pem" ]] && cp -a "${SHOES_CONF_DIR}/key.pem" "${SHOES_CONF_DIR}/key.pem.bak"
+    [[ -f "${SHOES_CONF_DIR}/cert.pem" ]] && cp -a "${SHOES_CONF_DIR}/cert.pem" "${SHOES_CONF_DIR}/cert.pem.bak"
 
     openssl ecparam -genkey -name prime256v1 -out "${SHOES_CONF_DIR}/key.pem"
     openssl req -new -x509 -days 365 -key "${SHOES_CONF_DIR}/key.pem" -out "${SHOES_CONF_DIR}/cert.pem" -subj "/CN=${ANYTLS_SNI}" -addext "subjectAltName=DNS:${ANYTLS_SNI}" >/dev/null 2>&1
+    chmod 600 "${SHOES_CONF_DIR}/key.pem" 2>/dev/null || true
 
     echo -e "${YELLOW}--> 正在重启服务以应用新证书...${RESET}"
     systemctl restart shoes
@@ -1448,17 +1684,29 @@ update_certificate() {
         generate_links
         echo -e "${GREEN}节点链接已同步更新！您可以返回主菜单查看。${RESET}"
     else
-        echo -e "${RED}服务重启失败，请检查系统日志！${RESET}"
+        echo -e "${RED}服务重启失败，正在自动回滚旧证书...${RESET}"
+        [[ -f "${SHOES_CONF_DIR}/key.pem.bak" ]] && mv -f "${SHOES_CONF_DIR}/key.pem.bak" "${SHOES_CONF_DIR}/key.pem"
+        [[ -f "${SHOES_CONF_DIR}/cert.pem.bak" ]] && mv -f "${SHOES_CONF_DIR}/cert.pem.bak" "${SHOES_CONF_DIR}/cert.pem"
+        systemctl restart shoes
     fi
 }
 
-# ================== 服务管理子菜单 ==================
+# ================== 服务管理子菜单 (无损更新与纯净卸载) ==================
 update_core() {
-    echo -e "\n${YELLOW}--> 正在更新 Shoes 核心...${RESET}"
-    systemctl stop shoes
-    download_shoes_smart "force"
-    systemctl restart shoes
-    echo -e "${GREEN}核心更新完成并已重启服务！当前版本: $(get_local_version)${RESET}"
+    echo -e "\n${YELLOW}--> 正在执行无损预检与更新 Shoes 核心...${RESET}"
+    if download_shoes_smart "force"; then
+        if check_installed; then
+            systemctl restart shoes
+            sleep 1
+            if check_running; then
+                echo -e "${GREEN}核心平滑更新并重启成功！当前运行版本: $(get_local_version)${RESET}"
+            else
+                echo -e "${RED}核心已替换，但服务启动异常，请通过日志排查！${RESET}"
+            fi
+        fi
+    else
+        echo -e "${YELLOW}更新未执行或未通过预检，原有运行中的节点服务未受任何中断。${RESET}"
+    fi
 }
 
 uninstall_shoes() {
@@ -1481,15 +1729,15 @@ uninstall_shoes() {
     systemctl stop shoes >/dev/null 2>&1
     systemctl disable shoes >/dev/null 2>&1
     rm -f "${SYSTEMD_FILE}"
-    rm -rf "${SHOES_CONF_DIR}"
-    rm -f "${SHOES_BIN}"
-    rm -f /etc/security/limits.d/99-bbr-optimization.conf
-    rm -f /etc/sysctl.d/99-bbr-optimization.conf
+    rm -rf "${SHOES_CONF_DIR}" "${TMP_DIR}"
+    rm -f "${SHOES_BIN}" "${SHOES_BIN}.new"
+    # 仅移除 Shoes 专属调优文件，保留系统全局 /etc/sysctl.d/99-bbr-optimization.conf 不受影响
+    rm -f "${LIMITS_CONF}" "${SYSCTL_CONF}"
     systemctl daemon-reload
-    echo -e "${GREEN}Shoes 及其相关配置与防火墙规则已完全卸载。${RESET}"
+    echo -e "${GREEN}Shoes 及其相关配置与防火墙规则已完全卸载 (系统原有 BBR 配置已完整保留)。${RESET}"
 }
 
-# 渲染双栈动态地址状态表格 (支持未安装时实时显示已探测到的公网 IP)
+# 渲染双栈动态地址状态表格
 render_address_table() {
     local v4_addr="未配置" v4_stat="${GRAY}— 等待安装部署${RESET}"
     local v6_addr="未配置" v6_stat="${GRAY}— 等待安装部署${RESET}"
@@ -1504,7 +1752,6 @@ render_address_table() {
         [[ -z "$env_v4" && -n "$CACHED_LIVE_V4" ]] && env_v4="$CACHED_LIVE_V4"
         [[ -z "$env_v6" && -n "$CACHED_LIVE_V6" ]] && env_v6="$CACHED_LIVE_V6"
 
-        # IPv4 行构造
         if [[ -n "$env_conn" ]]; then
             v4_addr="${CYAN}$(shorten_middle "$env_conn" 22)${RESET}"
             v4_stat="${CYAN}● DDNS / 固定地址${RESET}"
@@ -1522,7 +1769,6 @@ render_address_table() {
             v4_stat="${YELLOW}○ 等待公网探测${RESET}"
         fi
 
-        # IPv6 行构造
         if [[ -n "$env_v6" ]]; then
             v6_addr="${WHITE}$(format_ipv6_short "$env_v6" 22)${RESET}"
             if [[ "$SYNC_V6_CHANGED" -eq 1 ]]; then
@@ -1542,7 +1788,6 @@ render_address_table() {
             fi
         fi
     else
-        # 未安装节点时，直接展示启动时实时探测到的公网 IPv4 / IPv6
         if [[ -n "$CACHED_LIVE_V4" ]]; then
             v4_addr="${WHITE}${CACHED_LIVE_V4}${RESET}"
             v4_stat="${CYAN}○ 实时公网 (待部署)${RESET}"
@@ -1567,7 +1812,6 @@ render_address_table() {
     print_ip_table_row "${CYAN}IPv6${RESET}" "$v6_addr" "$v6_stat"
     echo -e "  ${GRAY}╰──────────┴─────────────────────────┴──────────────────────────╯${RESET}"
 
-    # 展示过一次变更提示后归零，避免后续切屏重复高亮
     SYNC_V4_CHANGED=0
     SYNC_V6_CHANGED=0
 }
@@ -1577,9 +1821,11 @@ service_menu() {
         clear
         local cur_sni="未配置"
         local cur_host="未配置"
+        local cur_cipher="未配置"
         if [[ -f "${SHOES_ENV_FILE}" ]]; then
             cur_sni=$(grep '^SNI=' "${SHOES_ENV_FILE}" | awk -F'"' '{print $2}')
             cur_host=$(grep '^HOST_NAME=' "${SHOES_ENV_FILE}" | awk -F'"' '{print $2}')
+            cur_cipher=$(grep '^SS_METHOD=' "${SHOES_ENV_FILE}" | awk -F'"' '{print $2}')
         fi
         local ver_str ver_disp run_disp
         ver_str=$(get_local_version)
@@ -1590,10 +1836,10 @@ service_menu() {
         echo -e "  ${CYAN}E-Shoes 节点与服务管理${RESET}"
         echo -e "${LINE_HEAVY}"
         print_kv_2col "${GRAY}核心版本 :${RESET} ${ver_disp}" "${GRAY}运行状态 :${RESET} ${run_disp}"
-        print_kv_2col "${GRAY}伪装域名 :${RESET} ${WHITE}$(shorten_middle "$cur_sni" 18)${RESET}" "${GRAY}节点前缀 :${RESET} ${WHITE}${cur_host}${RESET}"
+        print_kv_2col "${GRAY}伪装域名 :${RESET} ${WHITE}$(shorten_middle "$cur_sni" 18)${RESET}" "${GRAY}节点前缀 :${RESET} ${WHITE}$(shorten_middle "$cur_host" 18)${RESET}"
         render_address_table
-        echo -e "  ${CYAN}1.${RESET} ${WHITE}更新核心版本${RESET}  ${GRAY}— 保留现有配置升级 Shoes 核心${RESET}"
-        echo -e "  ${CYAN}2.${RESET} ${WHITE}卸载节点服务${RESET}  ${GRAY}— 彻底清理程序、配置及放行规则${RESET}"
+        echo -e "  ${CYAN}1.${RESET} ${WHITE}更新核心版本${RESET}  ${GRAY}— 沙盒无损预检并平滑升级 Shoes (v0.3.8+)${RESET}"
+        echo -e "  ${CYAN}2.${RESET} ${WHITE}卸载节点服务${RESET}  ${GRAY}— 彻底清理程序、配置及放行规则 (保留BBR)${RESET}"
         echo -e "  ${CYAN}3.${RESET} ${WHITE}启动节点服务${RESET}  ${GRAY}— 启动 Shoes 系统守护进程${RESET}"
         echo -e "  ${CYAN}4.${RESET} ${WHITE}停止节点服务${RESET}  ${GRAY}— 停止 Shoes 系统守护进程${RESET}"
         echo -e "  ${CYAN}5.${RESET} ${WHITE}重启节点服务${RESET}  ${GRAY}— 重新加载配置并重启进程${RESET}"
@@ -1601,12 +1847,13 @@ service_menu() {
         echo -e "${LINE_LIGHT}"
         echo -e "  ${CYAN}7.${RESET} ${WHITE}修改协议端口${RESET}  ${GRAY}— 单独或随机换端口，自动同步防火墙${RESET}"
         echo -e "  ${CYAN}8.${RESET} ${WHITE}修改伪装域名${RESET}  ${GRAY}— 切换预设/自定义 Reality 与 AnyTLS${RESET}"
-        echo -e "  ${CYAN}9.${RESET} ${WHITE}修改节点前缀${RESET}  ${GRAY}— 自定义节点别名 (无需重启服务)${RESET}"
+        echo -e "  ${CYAN}9.${RESET} ${WHITE}修改节点前缀${RESET}  ${GRAY}— 自定义节点别名 (自动URI编码，免重启)${RESET}"
         echo -e " ${CYAN}10.${RESET} ${WHITE}设置节点地址${RESET}  ${GRAY}— 强制刷新动态 IP 或绑定 DDNS 域名${RESET}"
+        echo -e " ${CYAN}11.${RESET} ${WHITE}切换SS加密法${RESET}  ${GRAY}— 切换 128-GCM / 256-GCM (${cur_cipher#2022-blake3-})${RESET}"
         echo -e "${LINE_LIGHT}"
         echo -e "  ${CYAN}0.${RESET} ${WHITE}返回上级菜单${RESET}"
         echo -e "${LINE_HEAVY}"
-        echo -ne "  ${WHITE}请选择操作 [0-10]: ${RESET}"
+        echo -ne "  ${WHITE}请选择操作 [0-11]: ${RESET}"
         read -r sub_choice
 
         case "$sub_choice" in
@@ -1620,6 +1867,7 @@ service_menu() {
             8) change_sni_menu ;;
             9) change_hostname_menu; echo "" && read -n 1 -s -r -p "按任意键返回..." ;;
             10) change_connect_host_menu ;;
+            11) change_ss_cipher_menu; echo "" && read -n 1 -s -r -p "按任意键返回..." ;;
             0) return ;;
             *) echo -e "${RED}无效选项，请重新输入！${RESET}"; sleep 1 ;;
         esac
@@ -1638,14 +1886,14 @@ show_main_menu() {
     fw_disp=$( [[ "$fw_status" == "none" ]] && echo "${GREEN}● 未启用 (全放行)${RESET}" || echo "${YELLOW}● ${fw_status} (运行中)${RESET}" )
 
     echo -e "${LINE_HEAVY}"
-    echo -e "  ${CYAN}E-Shoes 代理节点一键管理脚本${RESET} ${GRAY}v4.5${RESET}"
+    echo -e "  ${CYAN}E-Shoes 代理节点一键管理脚本${RESET} ${GRAY}v4.6${RESET}"
     echo -e "${LINE_HEAVY}"
     print_kv_2col "${GRAY}服务状态 :${RESET} ${inst_disp}" "${GRAY}运行状态 :${RESET} ${run_disp}"
     print_kv_2col "${GRAY}核心版本 :${RESET} ${ver_disp}" "${GRAY}防护状态 :${RESET} ${fw_disp}"
     render_address_table
     echo -e "  ${CYAN}1.${RESET} ${WHITE}全新安装部署${RESET}  ${GRAY}— 随机分配 >20300 端口并自动放行${RESET}"
-    echo -e "  ${CYAN}2.${RESET} ${WHITE}修复系统环境${RESET}  ${GRAY}— 保留原有节点配置并同步防火墙${RESET}"
-    echo -e "  ${CYAN}3.${RESET} ${WHITE}节点服务管理${RESET}  ${GRAY}— 更新 / 卸载 / 改端口 / 改SNI / 改地址${RESET}"
+    echo -e "  ${CYAN}2.${RESET} ${WHITE}修复系统环境${RESET}  ${GRAY}— 保留原有节点配置、校准密钥与防火墙${RESET}"
+    echo -e "  ${CYAN}3.${RESET} ${WHITE}节点服务管理${RESET}  ${GRAY}— 无损更新 / 改端口 / 改SNI / 切换加密${RESET}"
     echo -e "  ${CYAN}4.${RESET} ${WHITE}查看节点链接${RESET}  ${GRAY}— 实时校准双栈动态 IP 并输出订阅${RESET}"
     echo -e "  ${CYAN}5.${RESET} ${WHITE}查看实时日志${RESET}  ${GRAY}— 追踪 Shoes 核心运行状态与排错${RESET}"
     echo -e "${LINE_LIGHT}"
