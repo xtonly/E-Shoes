@@ -2,7 +2,8 @@
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 # ======================================================================
-# E-Shoes 代理节点一键管理脚本 (v4.6 — 深度适配 Shoes v0.3.8+)
+# E-Shoes 代理节点一键管理脚本 (v4.6.1 — 深度适配 Shoes v0.3.8+)
+# 修复：GitHub 最新版本号探测移除致命 -I (HEAD) 请求，改用零限流 302 Location 提取 + 双栈/镜像多级兜底
 # 修复：SS-2022 128-GCM (16B) 与 256-GCM (32B) 密钥长度自适应校验
 # 强化：无损原子更新核心 (沙盒预检 --version 与 --dry-run 通过才替换，清理 licenses/ 残留)
 # 修复：订阅链接节点名称标准 URL 编码 + 国旗 Emoji 4字节终端列宽精准对齐
@@ -38,6 +39,7 @@ LIMITS_CONF="/etc/security/limits.d/98-shoes-limits.conf"
 SYSCTL_CONF="/etc/sysctl.d/98-shoes-tuning.conf"
 SCRIPT_SOURCE="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
 TMP_DIR="/tmp/shoesdl"
+GH_DL_PREFIX="https://github.com"
 
 # 默认 SS-2022 算法 (兼容外部 sed 替换为 2022-blake3-aes-128-gcm)
 DEFAULT_SS_METHOD="2022-blake3-aes-256-gcm"
@@ -863,7 +865,7 @@ sync_dynamic_ip() {
     return 0
 }
 
-# ================== 架构检测与无损沙盒原子下载 (适配 v0.3.8 打包结构) ==================
+# ================== 架构检测与无损沙盒原子下载 (适配 v0.3.8 打包结构与多源防限流) ==================
 check_arch() {
     case "$(uname -m)" in
         x86_64)
@@ -883,19 +885,58 @@ check_arch() {
 }
 
 get_latest_version() {
-    LATEST_VER=$(curl -sL -A "Mozilla/5.0" --connect-timeout 8 --max-time 12 https://api.github.com/repos/cfal/shoes/releases/latest \
-        | grep '"tag_name":' \
-        | sed -E 's/.*"v?([^"]+)".*/\1/')
-    # 若 GitHub API 遭遇 403 限流，通过 releases/latest HTTP 302 Location 头无鉴权兜底提取版本号
-    if [[ -z "$LATEST_VER" ]]; then
-        LATEST_VER=$(curl -sIL -A "Mozilla/5.0" --connect-timeout 8 --max-time 12 -o /dev/null -w '%{url_effective}' https://github.com/cfal/shoes/releases/latest \
-            | awk -F'/tag/' '{print $2}' | sed 's/^v//' | tr -d '\r\n[:space:]')
-    fi
-    if [[ -z "$LATEST_VER" || "$LATEST_VER" == *"github.com"* ]]; then
-        echo -e "${RED}无法获取 Shoes 最新版本号，请检查服务器到 GitHub 的网络连接！${RESET}"
-        return 1
-    fi
-    return 0
+    LATEST_VER=""
+    GH_DL_PREFIX="https://github.com"
+
+    # 方式 1：优先通过 HTTP GET 读取 /releases/latest 的 302 Location 头提取版本号（零 API 限流、不下载网页正文、修复原 -I HEAD 拒跳 Bug）
+    local loc_ver="" effective_url=""
+    for flag in "-4" ""; do
+        loc_ver=$(curl $flag -sS --connect-timeout 6 --max-time 10 -D - -o /dev/null \
+            "https://github.com/cfal/shoes/releases/latest" 2>/dev/null \
+            | grep -i '^location:' | tail -n 1 | tr -d '\r\n[:space:]' \
+            | awk -F'/releases/tag/' '{print $2}' | sed 's/^v//; s/[/?#].*//')
+        if [[ -n "$loc_ver" ]]; then
+            LATEST_VER="$loc_ver"
+            return 0
+        fi
+
+        effective_url=$(curl $flag -fsSL --connect-timeout 6 --max-time 10 -o /dev/null -w '%{url_effective}' \
+            "https://github.com/cfal/shoes/releases/latest" 2>/dev/null || true)
+        if [[ "$effective_url" == *"/releases/tag/"* ]]; then
+            LATEST_VER=$(echo "$effective_url" | awk -F'/releases/tag/' '{print $2}' | sed 's/^v//; s/[/?#].*//' | tr -d '\r\n[:space:]')
+            [[ -n "$LATEST_VER" ]] && return 0
+        fi
+    done
+
+    # 方式 2：GitHub 官方 Releases API 兜底（使用合规 CLI UA，并用 grep -oE 兼容单行压缩 JSON）
+    for flag in "-4" ""; do
+        LATEST_VER=$(curl $flag -fsSL -H "Accept: application/vnd.github+json" -A "eshoes-updater/4.6.1" \
+            --connect-timeout 6 --max-time 10 "https://api.github.com/repos/cfal/shoes/releases/latest" 2>/dev/null \
+            | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"v?[^"]+"' | head -n 1 \
+            | sed -E 's/.*"v?([^"]+)"/\1/' | tr -d '\r\n[:space:]')
+        [[ -n "$LATEST_VER" ]] && return 0
+    done
+
+    # 方式 3：GitHub 直连受阻（纯 IPv6 / 受限网络）时，自动轮询加速镜像获取版本并同步切换下载源
+    local mirrors=(
+        "https://ghfast.top/https://github.com"
+        "https://gh-proxy.com/https://github.com"
+    )
+    for m in "${mirrors[@]}"; do
+        effective_url=$(curl -fsSL --connect-timeout 6 --max-time 10 -o /dev/null -w '%{url_effective}' \
+            "${m}/cfal/shoes/releases/latest" 2>/dev/null || true)
+        if [[ "$effective_url" == *"/releases/tag/"* ]]; then
+            LATEST_VER=$(echo "$effective_url" | awk -F'/releases/tag/' '{print $2}' | sed 's/^v//; s/[/?#].*//' | tr -d '\r\n[:space:]')
+            if [[ -n "$LATEST_VER" ]]; then
+                GH_DL_PREFIX="$m"
+                echo -e "${YELLOW}--> GitHub 直连受限，已自动切换至镜像源: ${m%/https://*}${RESET}"
+                return 0
+            fi
+        fi
+    done
+
+    echo -e "${RED}无法获取 Shoes 最新版本号，请检查服务器到 GitHub 的网络连接！${RESET}"
+    return 1
 }
 
 # 沙盒无损下载：绝不提前删除现网运行中的二进制，校验通过后再原子替换，并清理 v0.3.8 新增的 licenses/ 临时文件
@@ -926,27 +967,40 @@ download_shoes_smart() {
 
     local candidate_bin=""
     local variant_label=""
+    local dl_prefixes=("${GH_DL_PREFIX}")
+    if [[ "$GH_DL_PREFIX" == "https://github.com" ]]; then
+        dl_prefixes+=(
+            "https://ghfast.top/https://github.com"
+            "https://gh-proxy.com/https://github.com"
+        )
+    fi
 
     for item in "GNU:${GNU_FILE}" "MUSL:${MUSL_FILE}"; do
         variant_label="${item%%:*}"
         local pkg_name="${item#*:}"
         echo -e "${YELLOW}--> 尝试下载 ${variant_label} 版本 (v${LATEST_VER})...${RESET}"
 
-        rm -rf "${TMP_DIR:?}"/*
-        if wget --no-check-certificate --timeout=15 --tries=2 -qO "${TMP_DIR}/shoes.tar.gz" "https://github.com/cfal/shoes/releases/download/v${LATEST_VER}/${pkg_name}"; then
-            if tar -xzf "${TMP_DIR}/shoes.tar.gz" -C "${TMP_DIR}" 2>/dev/null; then
-                # 精确查找可执行主文件 (自动忽略 v0.3.8 新增的 LICENSE, THIRD_PARTY_NOTICES.md 与 licenses/ 目录)
-                local found_bin
-                found_bin=$(find "${TMP_DIR}" -maxdepth 2 -type f -name "shoes" | head -n 1)
-                if [[ -n "$found_bin" ]]; then
-                    chmod +x "$found_bin"
-                    if "$found_bin" --version >/dev/null 2>&1; then
-                        candidate_bin="$found_bin"
-                        break
+        for prefix in "${dl_prefixes[@]}"; do
+            rm -rf "${TMP_DIR:?}"/*
+            local dl_url="${prefix}/cfal/shoes/releases/download/v${LATEST_VER}/${pkg_name}"
+            if curl -4 -fsSL --connect-timeout 10 --max-time 60 --retry 1 -o "${TMP_DIR}/shoes.tar.gz" "$dl_url" 2>/dev/null || \
+               curl -fsSL --connect-timeout 10 --max-time 60 --retry 1 -o "${TMP_DIR}/shoes.tar.gz" "$dl_url" 2>/dev/null || \
+               wget -4 --no-check-certificate --timeout=15 --tries=2 -qO "${TMP_DIR}/shoes.tar.gz" "$dl_url" 2>/dev/null || \
+               wget --no-check-certificate --timeout=15 --tries=2 -qO "${TMP_DIR}/shoes.tar.gz" "$dl_url" 2>/dev/null; then
+                if [[ -s "${TMP_DIR}/shoes.tar.gz" ]] && tar -xzf "${TMP_DIR}/shoes.tar.gz" -C "${TMP_DIR}" 2>/dev/null; then
+                    # 精确查找可执行主文件 (自动忽略 v0.3.8 新增的 LICENSE, THIRD_PARTY_NOTICES.md 与 licenses/ 目录)
+                    local found_bin
+                    found_bin=$(find "${TMP_DIR}" -maxdepth 2 -type f -name "shoes" | head -n 1)
+                    if [[ -n "$found_bin" ]]; then
+                        chmod +x "$found_bin"
+                        if "$found_bin" --version >/dev/null 2>&1; then
+                            candidate_bin="$found_bin"
+                            break 2
+                        fi
                     fi
                 fi
             fi
-        fi
+        done
         echo -e "${YELLOW}${variant_label} 版本不可用或运行环境不匹配，正在尝试备选包...${RESET}"
     done
 
@@ -1886,7 +1940,7 @@ show_main_menu() {
     fw_disp=$( [[ "$fw_status" == "none" ]] && echo "${GREEN}● 未启用 (全放行)${RESET}" || echo "${YELLOW}● ${fw_status} (运行中)${RESET}" )
 
     echo -e "${LINE_HEAVY}"
-    echo -e "  ${CYAN}E-Shoes 代理节点一键管理脚本${RESET} ${GRAY}v4.6${RESET}"
+    echo -e "  ${CYAN}E-Shoes 代理节点一键管理脚本${RESET} ${GRAY}v4.6.1${RESET}"
     echo -e "${LINE_HEAVY}"
     print_kv_2col "${GRAY}服务状态 :${RESET} ${inst_disp}" "${GRAY}运行状态 :${RESET} ${run_disp}"
     print_kv_2col "${GRAY}核心版本 :${RESET} ${ver_disp}" "${GRAY}防护状态 :${RESET} ${fw_disp}"
